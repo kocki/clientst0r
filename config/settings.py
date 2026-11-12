@@ -14,7 +14,17 @@ from .version import get_version
 # under Docker Compose, `env_file: .env` injects the (often empty) keys into
 # the container environment at startup, and a plain load_dotenv() would NOT
 # overwrite them — so a key saved via the UI would never take effect (#137).
-load_dotenv(override=True)
+#
+# The AI gateway worker may run as its own OS user (clientst0r-ai, see
+# deploy/setup-ai-gateway-user.sh) that is deliberately unable to read .env,
+# which holds APP_MASTER_KEY. It gets its settings from the environment its
+# launcher passes instead, so an unreadable .env is skipped for that process
+# only; for every other process it is still an error.
+try:
+    load_dotenv(override=True)
+except PermissionError:
+    if os.environ.get('CLIENTST0R_PROCESS_ROLE') != 'ai_gateway':
+        raise
 
 # The AI gateway worker (config/settings_ai_gateway.py) runs from this same
 # file but must never hold the vault master key or any other secret: it only
@@ -22,12 +32,16 @@ load_dotenv(override=True)
 # CLIENTST0R_PROCESS_ROLE=ai_gateway; every secret-looking variable that
 # .env just loaded is dropped again before anything below reads it, and the
 # few settings that must be non-empty get throwaway per-process values.
+# DB_PASSWORD is the one secret it keeps: the worker reads and writes its
+# rows through the database by design, and without it a MariaDB/MySQL
+# install's worker could not connect at all.
 AI_GATEWAY_ROLE = 'worker' if os.environ.get('CLIENTST0R_PROCESS_ROLE') == 'ai_gateway' else ''
+_AI_GATEWAY_KEEP = ('AI_GATEWAY_KEY_DIR', 'DB_PASSWORD')
 if AI_GATEWAY_ROLE:
     import secrets as _secrets
     for _name in list(os.environ):
         if (any(t in _name for t in ('KEY', 'SECRET', 'TOKEN', 'PASSWORD', 'PASSWD', 'CREDENTIAL'))
-                and _name != 'AI_GATEWAY_KEY_DIR'):
+                and _name not in _AI_GATEWAY_KEEP):
             del os.environ[_name]
     os.environ['SECRET_KEY'] = _secrets.token_urlsafe(48)
     os.environ['API_KEY_SECRET'] = _secrets.token_urlsafe(48)
@@ -110,8 +124,11 @@ INSTALLED_APPS = [
     'inventory.apps.InventoryConfig',
     'scheduling.apps.SchedulingConfig',
     'psa.apps.PsaConfig',
+    'psa.routing.apps.TicketRoutingConfig',
+    'psa.support_workflows.apps.SupportWorkflowsConfig',
     'psa_ai.apps.PsaAiConfig',
     'tech_access.apps.TechAccessConfig',
+    'rmm_permissions.apps.RmmPermissionsConfig',
     'portal.apps.PortalConfig',
     'resourcing.apps.ResourcingConfig',
     'crm.apps.CrmConfig',
@@ -151,12 +168,14 @@ MIDDLEWARE = [
     'axes.middleware.AxesMiddleware',
     'core.middleware.CurrentOrganizationMiddleware',
     'accounts.middleware.SectionPermissionMiddleware',  # vault_view / docs_view / assets_view by URL prefix
+    'core.org_context_guard.OrgContextGuardMiddleware',  # refuse saves made after switching client in another tab
     'accounts.middleware.SessionIdleTimeoutMiddleware',
     'accounts.middleware.Enforce2FAMiddleware',
     'accounts.middleware.UserLanguageMiddleware',
     'core.ai_abuse_control.AIAbuseControlMiddleware',  # AI endpoint protection
     'audit.middleware.AuditLoggingMiddleware',
     'tech_access.middleware.ReadTrackingMiddleware',  # theft detection + containment
+    'core.workspace.WorkspaceMiddleware',  # default saved list views + recent devices
 ]
 
 # Optional middleware - only add if dependencies are installed
@@ -680,6 +699,13 @@ APP_MASTER_KEY_PREVIOUS = os.getenv('APP_MASTER_KEY_PREVIOUS', '')
 AI_GATEWAY_MODE = os.getenv('AI_GATEWAY_MODE', 'in_process')
 AI_GATEWAY_KEY_DIR = os.getenv('AI_GATEWAY_KEY_DIR', '')
 
+# Ticket AI and automation history (psa_ai/services/history.py): days kept
+# for customers whose AI policy doesn't set its own window. 0 = keep.
+try:
+    PSA_AI_HISTORY_RETENTION_DAYS = max(0, int(os.getenv('PSA_AI_HISTORY_RETENTION_DAYS', '365')))
+except ValueError:
+    PSA_AI_HISTORY_RETENTION_DAYS = 365
+
 # API Key settings - must be separate from SECRET_KEY for security
 API_KEY_SECRET = os.getenv('API_KEY_SECRET')
 if not API_KEY_SECRET:
@@ -763,6 +789,21 @@ GITHUB_REPO_OWNER = os.getenv('GITHUB_REPO_OWNER', 'agit8or1')
 GITHUB_REPO_NAME = os.getenv('GITHUB_REPO_NAME', 'clientst0r')
 AUTO_UPDATE_ENABLED = os.getenv('AUTO_UPDATE_ENABLED', 'True').lower() == 'true'
 AUTO_UPDATE_CHECK_INTERVAL = int(os.getenv('AUTO_UPDATE_CHECK_INTERVAL', '21600'))  # 6 hours in seconds (reduced API calls)
+
+# Upgrade safety (core/upgrade/, docs/UPGRADE_AND_RECOVERY.md).
+# Pre-upgrade backups (database + uploads + keys) and the upgrade journal.
+# Owner-only; keep it on a disk with room for a full copy of the database
+# and uploads.
+UPGRADE_BACKUP_DIR = Path(os.getenv('CLIENTST0R_BACKUP_DIR', str(BASE_DIR / 'backups' / 'upgrades')))
+# Verified pre-upgrade backups kept after a successful upgrade (older ones are removed).
+UPGRADE_BACKUPS_KEEP = int(os.getenv('UPGRADE_BACKUPS_KEEP', '5'))
+# Trusted release signers. Empty: /etc/clientst0r/allowed_signers (root
+# helper), else the allowed_signers committed in the installed revision.
+RELEASE_SIGNERS_FILE = os.getenv('CLIENTST0R_RELEASE_SIGNERS_FILE', '')
+# MySQL/MariaDB: scratch database the backup is restore-tested into. Empty:
+# <DB_NAME>_verify, created and dropped if the account may; otherwise a
+# structural check of the dump is done instead.
+UPGRADE_VERIFY_DB_NAME = os.getenv('CLIENTST0R_VERIFY_DB_NAME', '')
 
 # GraphQL Configuration
 GRAPHENE = {

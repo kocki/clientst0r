@@ -57,6 +57,9 @@ def global_search(request):
         'passwords': [],
         'psa_companies': [],
         'psa_contacts': [],
+        'tickets': [],
+        'rmm_devices': [],
+        'clients': [],
         'total_count': 0,
         # Real match counts per category, before the RESULT_LIMIT slice, so
         # the page can say "showing 10 of 37" instead of implying 10 is all.
@@ -84,9 +87,10 @@ def global_search(request):
     def permitted(model, perm):
         """`scoped()` narrowed to the customers whose role grants `perm`.
 
-        Role flags vault_view / docs_view / assets_view are enforced here the
-        same way the section middleware enforces them on /vault/, /docs/ and
-        /assets/ — search must not list titles a user can't open.
+        Role flags vault_view / docs_view / assets_view / integrations_view
+        are enforced here the same way the section middleware enforces them
+        on /vault/, /docs/, /assets/ and /integrations/ — search must not
+        list titles a user can't open.
         """
         return filter_by_org_perm(scoped(model), user, perm)
 
@@ -149,13 +153,14 @@ def global_search(request):
 
         # Search PSA Companies / Contacts. Scoped by their own organization
         # the way `integrations.views` does, not via the connection — same
-        # rows, and it picks up descendants like everything else here.
+        # rows, and it picks up descendants like everything else here. They
+        # open under /integrations/, so integrations_view governs them.
         try:
-            take('psa_companies', scoped(PSACompany).filter(
+            take('psa_companies', permitted(PSACompany, 'integrations_view').filter(
                 Q(name__icontains=query)
             ))
 
-            take('psa_contacts', scoped(PSAContact).filter(
+            take('psa_contacts', permitted(PSAContact, 'integrations_view').filter(
                 Q(name__icontains=query) |
                 Q(email__icontains=query)
             ))
@@ -163,6 +168,48 @@ def global_search(request):
             # The PSA tables are optional on an install that has never had an
             # integration configured; a search must not 500 over that.
             logger.debug('PSA search skipped', exc_info=True)
+
+        # Tickets (PSA on): the ticket list's own scoping — every ticket for
+        # MSP staff, shared tickets of their customers for customer users. A
+        # ticket number typed exactly is listed first.
+        from core.models import SystemSetting
+        from psa.visibility import is_msp_staff
+        staff_user = is_msp_staff(user)
+        if getattr(SystemSetting.get_settings(), 'psa_enabled', False):
+            try:
+                from django.db.models import Case, IntegerField, Value, When
+                from psa.views import _scoped_ticket_qs
+                tickets = _scoped_ticket_qs(request).filter(
+                    Q(ticket_number__icontains=query) | Q(subject__icontains=query)
+                ).annotate(_exact=Case(When(ticket_number__iexact=query, then=Value(0)),
+                                       default=Value(1), output_field=IntegerField())
+                           ).order_by('_exact', '-created_at')
+                take('tickets', tickets)
+            except Exception:
+                logger.debug('ticket search skipped', exc_info=True)
+
+        # RMM devices (MSP staff): the same customer scoping as assets above,
+        # settled customers only. Results open through core:open_device, so a
+        # device of another customer switches context instead of 404ing.
+        if staff_user:
+            try:
+                from integrations.models import RMMDevice
+                take('rmm_devices', permitted(RMMDevice, 'assets_view').filter(
+                    ownership_status=RMMDevice.OWNERSHIP_RESOLVED,
+                ).filter(
+                    Q(device_name__icontains=query) | Q(hostname__icontains=query)
+                    | Q(serial_number__icontains=query) | Q(ip_address__icontains=query)
+                ).select_related('organization'))
+            except Exception:
+                logger.debug('RMM device search skipped', exc_info=True)
+
+        # Clients the technician may switch to (the client switcher's rule).
+        # Staff only: a customer user's only "client" is their own company, and
+        # the results link to the staff Customer Operations page.
+        if staff_user:
+            from core.client_switcher import authorized_organizations
+            take('clients', authorized_organizations(request).filter(
+                name__icontains=query).order_by('name'))
 
         # Real total across categories, not the sum of the sliced lists.
         results['total_count'] = sum(results['counts'].values())

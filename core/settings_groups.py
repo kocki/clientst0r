@@ -32,6 +32,7 @@ SETTINGS_GROUPS = {
         ('updates', 'core:system_updates', 'superuser'),
         ('system_status', 'core:system_status', 'superuser'),
         ('features', 'core:settings_features', 'superuser'),
+        ('modules', 'core:settings_modules', 'superuser'),
         ('psa', 'core:settings_psa', 'psa'),
         ('scheduler', 'core:settings_scheduler', 'superuser'),
         ('smtp', 'core:settings_smtp', 'superuser'),
@@ -43,6 +44,7 @@ SETTINGS_GROUPS = {
     'security': (
         ('security', 'core:settings_security', 'superuser'),
         ('technician_access', 'tech_access:index', 'superuser'),
+        ('rmm_permissions', 'rmm_permissions:index', 'superuser'),
         ('security_dashboard', 'core:security_dashboard', 'superuser'),
         ('firewall', 'core:firewall_settings', 'superuser'),
         ('fail2ban', 'core:fail2ban_status', 'superuser'),
@@ -56,6 +58,7 @@ SETTINGS_GROUPS = {
     'integrations': (
         ('webhooks', 'core:webhook_list', 'login'),
         ('integrations', 'integrations:integration_list', 'superuser'),
+        ('rmm_rem0te', 'integrations:rem0te_setup', 'superuser'),
         ('ai', 'core:settings_ai', 'superuser'),
         ('ticket_ai', 'psa_ai:profiles', 'superuser'),
         ('sms', 'core:settings_sms', 'superuser'),

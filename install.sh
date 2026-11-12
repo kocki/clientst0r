@@ -146,7 +146,7 @@ if [ "$EXISTING_INSTALL" = true ]; then
     echo ""
     echo "What would you like to do?"
     echo ""
-    echo "  1) Upgrade/Update (pull latest code, run migrations, restart service)"
+    echo "  1) Upgrade/Update (verified release, backup first, then migrate and reload)"
     echo "  2) System Check (verify all components are working)"
     echo "  3) Clean Install (remove everything and reinstall)"
     echo "  4) Exit"
@@ -178,16 +178,11 @@ if [ "$EXISTING_INSTALL" = true ]; then
 
             print_status "Configuration file verified"
 
-            # Stop service and kill any gunicorn processes
-            print_info "Stopping service..."
-            sudo systemctl stop clientst0r-gunicorn.service 2>/dev/null || true
-            sudo pkill -9 gunicorn 2>/dev/null || true
-            sleep 1
-
-            # Pull latest code
-            print_info "Pulling latest code from GitHub..."
+            # The service keeps running while the upgrade is prepared: it is only
+            # reloaded once the new code is installed and migrated. (Earlier
+            # versions stopped it and ran `pkill -9 gunicorn`, which also killed
+            # every other gunicorn on the host.)
             cd "$INSTALL_DIR"
-            git pull origin main || print_warning "Git pull failed or not a git repository"
 
             # Check if venv exists, create if missing
             if [ ! -d "venv" ] || [ ! -f "venv/bin/activate" ]; then
@@ -211,13 +206,14 @@ if [ "$EXISTING_INSTALL" = true ]; then
                     exit 1
                 fi
                 print_status "Virtual environment created"
+                NEW_VENV=1
             fi
 
-            # Activate venv and upgrade dependencies
-            print_info "Updating Python dependencies..."
             source venv/bin/activate
-            pip install --upgrade pip -q
-            pip install -r requirements.txt --upgrade --progress-bar on
+            if [ "${NEW_VENV:-0}" = "1" ]; then
+                pip install --upgrade pip -q
+                pip install -r requirements.txt --progress-bar on
+            fi
 
             # Check and install Snyk CLI if missing
             print_info "Checking for Snyk CLI..."
@@ -247,15 +243,6 @@ if [ "$EXISTING_INSTALL" = true ]; then
             else
                 print_status "Snyk CLI already installed"
             fi
-
-            # Run migrations (makemigrations first to catch any missing migration files)
-            print_info "Running database migrations..."
-            python3 manage.py makemigrations --no-input 2>/dev/null || true
-            python3 manage.py migrate
-
-            # Collect static files
-            print_info "Collecting static files..."
-            python3 manage.py collectstatic --noinput
 
             # Recreate service file if missing (handles older installs or renamed service)
             if ! sudo systemctl list-unit-files | grep -q clientst0r-gunicorn.service; then
@@ -304,14 +291,46 @@ SVCEOF
                 print_status "Service file created"
             fi
 
-            # Restart service
-            print_info "Restarting service..."
-            sudo systemctl start clientst0r-gunicorn.service
+            # The upgrade itself: the same verified pipeline as Settings -> Updates.
+            # It shows what it would install (release tag + commit), checks the
+            # tag signature, runs preflight checks, takes and verifies a backup
+            # (database, uploads, keys), migrates and reloads the service.
+            # Never `makemigrations` here: locally generated migration files
+            # conflict with the ones the next release ships (issues #91, #110).
+            # See docs/UPGRADE_AND_RECOVERY.md.
+            if python3 manage.py help upgrade_apply >/dev/null 2>&1; then
+                set +e
+                python3 manage.py upgrade_apply
+                UPGRADE_RC=$?
+                set -e
+                case $UPGRADE_RC in
+                    0) ;;
+                    4) print_warning "Upgrade refused; nothing was changed (see the reason above)." ;;
+                    *) print_error "Upgrade failed. The verified pre-upgrade backup and recovery steps are shown above."
+                       echo "  Status:   python3 manage.py upgrade_status"
+                       echo "  Guide:    $INSTALL_DIR/docs/UPGRADE_AND_RECOVERY.md"
+                       exit $UPGRADE_RC ;;
+                esac
+            else
+                print_error "This checkout has no upgrade_apply command (an older release)."
+                echo "Update it from Settings -> Updates, or: git pull origin main, then run ./install.sh again."
+                exit 1
+            fi
+
+            if ! sudo systemctl is-active --quiet clientst0r-gunicorn.service; then
+                print_info "Starting service..."
+                sudo systemctl start clientst0r-gunicorn.service
+            fi
 
             # Check status
             sleep 2
             if sudo systemctl is-active --quiet clientst0r-gunicorn.service; then
                 print_status "Upgrade complete! Service is running."
+                if [ ! -f /etc/systemd/system/clientst0r-ai-gateway.service ] \
+                        || ! grep -q '^User=clientst0r-ai$' /etc/systemd/system/clientst0r-ai-gateway.service; then
+                    print_info "Optional: run the Ticket AI gateway worker as its own user (can't read .env):"
+                    echo "  bash $INSTALL_DIR/deploy/setup-ai-gateway-user.sh"
+                fi
                 SERVER_IP=$(hostname -I | awk '{print $1}')
                 echo ""
                 echo "Access at: http://${SERVER_IP}:8000"
@@ -658,8 +677,13 @@ print_info "Step 5/11: Creating environment configuration..."
 if [ -f ".env" ]; then
     print_warning ".env file already exists, backing up to .env.backup"
     cp .env .env.backup
+    chmod 600 .env.backup
 fi
 
+# .env holds the database password and the keys that decrypt the vault:
+# owner-only from the moment it exists.
+OLD_UMASK=$(umask)
+umask 077
 cat > .env << EOF
 # Django Settings
 DEBUG=True
@@ -694,8 +718,10 @@ SITE_URL=http://localhost:8000
 # overrides that and locks the field, e.g.:
 # REQUIRE_2FA=True
 EOF
+umask "$OLD_UMASK"
+chmod 600 .env
 
-print_status "Environment file created (.env)"
+print_status "Environment file created (.env, mode 600)"
 print_info "Secure random database password generated"
 
 # Step 5.5: Root helper
@@ -740,6 +766,7 @@ sudo mysql << EOSQL
 CREATE DATABASE IF NOT EXISTS clientst0r CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 CREATE USER IF NOT EXISTS 'clientst0r'@'localhost' IDENTIFIED BY '${DB_PASSWORD}';
 GRANT ALL PRIVILEGES ON clientst0r.* TO 'clientst0r'@'localhost';
+GRANT ALL PRIVILEGES ON clientst0r_verify.* TO 'clientst0r'@'localhost';
 FLUSH PRIVILEGES;
 EOSQL
 
@@ -755,6 +782,7 @@ else
     echo "  CREATE DATABASE clientst0r CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
     echo "  CREATE USER 'clientst0r'@'localhost' IDENTIFIED BY '<password from .env>';"
     echo "  GRANT ALL PRIVILEGES ON clientst0r.* TO 'clientst0r'@'localhost';"
+    echo "  GRANT ALL PRIVILEGES ON clientst0r_verify.* TO 'clientst0r'@'localhost';  -- backup restore test"
     echo "  FLUSH PRIVILEGES;"
     echo ""
     read -p "Press Enter once you've created the database manually..."
@@ -832,9 +860,14 @@ print_status "Static files collected"
 echo ""
 print_info "Step 12/12: Starting production server..."
 
-# Stop any existing service and kill processes
+# Stop any existing service, and any gunicorn still serving THIS directory.
+# (A bare `pkill -9 gunicorn` also killed every other gunicorn on the host.)
 sudo systemctl stop clientst0r-gunicorn.service 2>/dev/null || true
-sudo pkill -9 gunicorn 2>/dev/null || true
+for pid in $(pgrep -f 'gunicorn.*wsgi:application' 2>/dev/null || true); do
+    if [ "$(sudo readlink -f "/proc/$pid/cwd" 2>/dev/null)" = "$(readlink -f "$INSTALL_DIR")" ]; then
+        sudo kill "$pid" 2>/dev/null || true
+    fi
+done
 sleep 2
 
 # Create systemd service file
@@ -940,6 +973,9 @@ install_timer_units() {
         base="$(basename "$unit")"
         # gunicorn is written separately above, with its own placeholders.
         [ "$base" = "clientst0r-gunicorn.service" ] && continue
+        # The AI gateway worker runs as its own user and is installed by
+        # deploy/setup-ai-gateway-user.sh (install_ai_gateway_worker below).
+        [ "$base" = "clientst0r-ai-gateway.service" ] && continue
 
         sudo cp "$unit" "/etc/systemd/system/$base"
         # Order matters: rewrite the paths first, then the bare User=/Group=
@@ -984,6 +1020,42 @@ install_timer_units() {
 }
 
 install_timer_units
+
+# ---------------------------------------------------------------------------
+# AI gateway worker as its own OS user (Phase 57.3, OPTIONAL AI)
+#
+# Ticket AI provider keys are sealed to the gateway key pair. With
+# AI_GATEWAY_MODE=worker only the restricted worker opens them; running that
+# worker as `clientst0r-ai`, a user that cannot read .env, means the process
+# that talks to the model can never hold APP_MASTER_KEY. The script creates
+# the user, the root-only worker environment (DB_* only), the key pair in
+# /etc/clientst0r/ai-gateway, sets AI_GATEWAY_MODE=worker in .env, and starts
+# clientst0r-ai-gateway.service. If anything is not as it needs to be (for
+# example the worker could read .env) it stops before changing .env, and the
+# install continues in the default in-process mode.
+# Existing installs: bash deploy/setup-ai-gateway-user.sh
+# Skip on a fresh install with CLIENTST0R_AI_GATEWAY_USER=n.
+# ---------------------------------------------------------------------------
+install_ai_gateway_worker() {
+    if [ "${CLIENTST0R_AI_GATEWAY_USER:-y}" = "n" ]; then
+        print_info "AI gateway worker user skipped (CLIENTST0R_AI_GATEWAY_USER=n)."
+        return 0
+    fi
+    print_info "Setting up the AI gateway worker as its own user (clientst0r-ai)..."
+    if bash "$INSTALL_DIR/deploy/setup-ai-gateway-user.sh" "$INSTALL_DIR"; then
+        sudo systemctl restart clientst0r-gunicorn.service
+        for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8000/health/ >/dev/null 2>&1 && break
+            sleep 2
+        done
+        print_status "AI gateway worker running as clientst0r-ai (AI_GATEWAY_MODE=worker)"
+    else
+        print_warning "AI gateway worker not set up as its own user; Ticket AI stays in the default"
+        print_warning "in-process mode. Fix the reason above and run: bash deploy/setup-ai-gateway-user.sh"
+    fi
+}
+
+install_ai_gateway_worker
 
 # Get server IP address
 SERVER_IP=$(hostname -I | awk '{print $1}')

@@ -1,5 +1,108 @@
 # Navigation map: before → after
 
+## Primary sidebar (technician workspace)
+
+The dropdown menus in the top bar were replaced by a sidebar of seven
+technician groups — **My Work, Tickets, Clients, Devices, Alerts, Tools,
+Reports** — with **Settings** at its foot for administrative and advanced
+configuration. The registry is `core/navigation.py` (`PRIMARY`, `SETTINGS`);
+the markup is `templates/core/_primary_nav.html`; behaviour (filter as you
+type, collapse to an icon rail, phone/tablet drawer, `g`-shortcuts) is
+`static/js/app_nav.js`. The top bar keeps the brand, search, client switcher,
+utility buttons and the account menu. **No URL changed**; every section keeps
+its tabs above the content, and every tab is also nested under its entry in
+the sidebar so the filter finds it by name.
+
+Gating is the old gate for each entry plus the server's own URL rules
+(`SectionPermissionMiddleware`: MSP-staff-only `/reports/ /crm/ /security/`,
+and `vault_view` / `docs_view` / `assets_view` for the current customer). A
+link the server would answer with 403 is not drawn.
+
+| Before (top bar) | After (sidebar) | Gate |
+|---|---|---|
+| Dashboard (direct link) | My Work → Dashboard | auth |
+| PSA → My Work | My Work → My Work | psa |
+| PSA → Tickets | Tickets → Tickets (tabs nested) | psa |
+| PSA → Dispatch Board | Tickets → Dispatch Board | psa |
+| PSA → Projects | Tickets → Projects | psa |
+| PSA → Service Management | Tickets → Service Management | psa |
+| PSA → Billing | Clients → Billing | psa |
+| PSA → Procurement | Tools → Procurement | psa |
+| Operations → Workflows | Tools → Workflows | workflows |
+| Operations → Inventory | Tools → Inventory | inventory |
+| Operations → Scheduling | Tools → Scheduling | scheduling |
+| Operations → Monitoring | Alerts → Monitoring | monitoring |
+| Operations → Vehicles | Tools → Vehicles | vehicles |
+| Modules → Security | Alerts → Security Alerts | staff + psa |
+| Modules → CRM | Clients → CRM | staff + crm |
+| Modules → Reports | Reports → Reports | staff |
+| Assets → All Assets | Devices → All Assets | auth + assets_view |
+| Assets → Hardware & Ports | Devices → Hardware & Ports | auth + assets_view |
+| Assets → Infrastructure | Devices → Infrastructure | auth |
+| Assets → Asset Setup | Settings → Asset Setup | staff + assets_view |
+| Docs → Documents / Diagrams / Review & Publishing / Documentation Readiness | Clients → same four entries | auth + docs_view |
+| Vault → Passwords | Clients → Passwords | auth + vault_view |
+| Vault → Access Rules | Clients → Vault Access Rules | auth + vault_view |
+| Vault → My Vault | My Work → My Vault | auth |
+| Vault → Secure Notes | My Work → Secure Notes | auth |
+| Admin → System / Security / Integrations / Mobile | Settings → System / Security / Integrations / Mobile | su |
+| Admin → Organizations & Access | Clients → All Clients (Organizations); Settings → Access Management | auth / su |
+| Favorites star (bar) | unchanged in the bar; also My Work → Favorites | auth |
+| Global KB link (bar, PSA off) | Tools → Global KB | global_kb, not psa, staff/su |
+| *(new)* | Clients → Customer Operations (`core:customer_ops_current`) | auth |
+| *(new)* | Devices → RMM Devices (`integrations:rmm_devices`) | staff |
+| *(new)* | Alerts → RMM Alerts (`integrations:rmm_alerts`) | staff |
+| Account menu (My Profile, My Work Details, Help, Apps & Downloads, Sign Out) | unchanged, top bar | auth |
+
+### Pages added on the dev branch (previously linked only from inside their apps)
+
+Each gate is the page's own view-level check, so the link appears exactly for
+the users the page lets in (`core/navigation.py`, the `_check_*` gates).
+Pages with their own local nav (ticket routing's `_nav.html`) get a sidebar
+entry rather than a tab strip.
+
+| Page | Sidebar | Gate |
+|---|---|---|
+| Shift schedule (`resourcing:shift_schedule`, `/resourcing/shifts/`) | Tickets → Shifts & Locations (landing, tab) | staff |
+| Shift templates (`resourcing:shift_templates`) | Tickets → Shifts & Locations → tab | staff + `can_manage_shifts` (`resourcing_approve_leave` or `routing_manage_rules`, su) |
+| Share my position with dispatch, the technician's consent (`field_ops:dispatch_sharing`) | Tickets → Shifts & Locations → Location Sharing | staff |
+| Dispatch geo settings (`field_ops:dispatch_geo_settings`) | Tickets → Shifts & Locations → Dispatch Locations | su who is MSP staff |
+| Billing review (`psa:billing_review`, `/psa/billing-review/`) | Clients → Billing → tab | psa + `require_admin` + staff |
+| Serial search (`assets:serial_search`, `/assets/serials/`) | Devices → All Assets → tab | auth + assets_view |
+| Workflow flow map (`psa:workflow_rule_map`, `/psa/rules/flow/`) | Tickets → Tickets → Workflow Flow Map | psa + `require_admin` + staff |
+| Support workflows admin (`support_workflows:admin`) | Tools → Support Workflows | psa + `routing_manage_rules` |
+| Alert policy (`ticket_routing:alerts`) | Alerts → Alert Policy (its rule and maintenance pages light up Alerts too) | psa + `routing_manage_rules` |
+| RMM permissions (`rmm_permissions:index`, `/settings/security/rmm-permissions/`) | Settings → RMM Permissions (also still in the Settings page menu) | `policy.manage` or `audit.review` |
+| KB analytics (`docs:kb_analytics`) | Clients → Review & Publishing → KB Analytics (already a tab; unchanged) | staff/su |
+| Security digest (`security_alerts:digest_subscriptions`) | Alerts → Security Alerts → Weekly Digest | staff + psa + `security_alerts_view` |
+| LDAP group mappings (`accounts:ldap_group_mappings`) | Settings → LDAP Group Mappings | su |
+| Rem0te setup wizard (`integrations:rem0te_setup`) | Settings → Integrations → Rem0te Setup (also still in the Settings page menu) | su |
+
+### Saved views and default filters
+
+The saved-views bar (`core/workspace.py` `SAVED_VIEW_LISTS`, drawn by
+`templates/core/_work_context.html`) is on these lists. Each list keeps its
+existing URL and query parameters; a saved view stores only those
+parameters, and `?view=all` skips a default view.
+
+| List | Filters (query parameters) | Bar shown to |
+|---|---|---|
+| Tickets (`psa:ticket_list`) | client status priority queue assigned q | staff |
+| RMM devices (`integrations:rmm_devices`) | q status type link | staff |
+| All assets (`assets:asset_list`) | client type manufacturer status location (site) needs_reorder q/search, sort, per_page (25/50/100/200, default 50, sorted by name); staff also rmm (online/offline/stale/linked/unlinked) and alerts=active | anyone who may open the list; RMM presets staff only |
+| RMM alerts (`integrations:rmm_alerts`) | status severity client q | staff |
+| Routing triage (`ticket_routing:triage`) | client routing (suggested/fallback) priority q | staff |
+| Invoices (`psa:invoice_list`) | status client q | staff, or `billing_view_invoices` |
+| Timesheet approvals (`psa:timesheet_approval_queue`) | tech decision | staff |
+
+Keyboard: `?` help, `/` search, `j` jump-to (sidebar filter), `[` collapse,
+`g` then `w t c d a o r s` for the groups.
+
+The sections below describe the earlier condensed dropdowns; their **tabs**
+are unchanged and still apply.
+
+## Condensed dropdowns (superseded by the sidebar)
+
 The global menu was condensed so each dropdown holds 3–7 entries. Every
 destination the old menus carried is still reachable by ordinary clicks: either
 as a menu entry, or as a **tab** on that entry's landing page. Tabs are drawn
@@ -198,6 +301,7 @@ Help Us Grow, Global KB, search, theme, clock, client switcher, account menu).
 | Client switcher (`core/_client_switcher.html`, `#orgDropdown`): active client / Global View pill, switch list, new "All clients" link | `current_organization or su or is_staff_user`; Global View entry su or is_staff_user; All clients psa or su |
 | Shortcut strip (`core/_shortcut_strip.html`, below the navbar): up to three pinned pages, My Work and Tickets by default, edited with the pencil | MSP staff only (`core/shortcut_strip.py`) |
 | Update badge (links to Settings → Updates) when the scheduled check found a newer release | su |
+| Customer operations link in the client switcher's current-context block (`core:customer_ops`); also an Operations button on the customer page | `current_organization`; the page itself gates each section by role |
 
 ## Settings sidebar additions
 
@@ -209,6 +313,7 @@ rather than a top-level menu:
 | Technician Access (`/settings/security/technician-access/`) | Security → Technician Access | su |
 | Ticket AI models and customer AI policies (OPTIONAL AI; used only while `psa_ai_enabled` is on) | Integrations → Ticket AI models | su |
 | RMM pairing for ticket integration (v3.17.658) | Integrations → Integrations (or Admin → Integrations), then the RMM connection → Configure | admin (Owner or Admin of that customer, staff or su); turning pairing on is a protected change |
+| Optional Modules (`/core/settings/modules/`): every optional module, its dependencies, what users see, links to its settings | System → Optional Modules (next to Feature Toggles) | su |
 
 ## Customer users
 

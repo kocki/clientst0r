@@ -39,11 +39,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:$PATH" \
     DJANGO_SETTINGS_MODULE=config.settings
 
-# Runtime libs only: mariadb client, curl (used by HEALTHCHECK) and ping
-# (scheduled WAN connection checks; Docker's default ping_group_range lets the
-# non-root user send ICMP echo).
+# Runtime libs only: mariadb client library, the mariadb client tools
+# (mysqldump / mysql: the pre-upgrade backup and its restore test), curl (used
+# by HEALTHCHECK) and ping (scheduled WAN connection checks; Docker's default
+# ping_group_range lets the non-root user send ICMP echo).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libmariadb3 \
+        mariadb-client \
         curl \
         iputils-ping \
     && rm -rf /var/lib/apt/lists/*
@@ -54,8 +56,18 @@ COPY --from=builder /opt/venv /opt/venv
 # Non-root runtime user. uid 1000 is the common host-default — matches
 # typical bind-mount ownership without extra chown gymnastics.
 RUN useradd -m -u 1000 clientst0r \
-    && mkdir -p /app /app/logs /app/media /app/static_collected /var/lib/itdocs/uploads \
+    && mkdir -p /app /app/logs /app/media /app/static_collected /app/backups /var/lib/itdocs/uploads \
     && chown -R clientst0r:clientst0r /app /var/lib/itdocs
+
+# The AI gateway worker's own user (Phase 57.3, OPTIONAL AI; the
+# `ai-gateway` compose profile). Primary group `clientst0r`, so it can read
+# the code (files are 644, nothing in /app is group-writable) and share the
+# gateway key directory with the app, which reads public.key only.
+# private.key is 0600 and owned by this user. The worker never gets .env.
+RUN useradd -M -u 1001 -g clientst0r -s /usr/sbin/nologin clientst0r-ai \
+    && mkdir -p /var/lib/clientst0r/ai-gateway \
+    && chown clientst0r-ai:clientst0r /var/lib/clientst0r/ai-gateway \
+    && chmod 750 /var/lib/clientst0r/ai-gateway
 
 WORKDIR /app
 

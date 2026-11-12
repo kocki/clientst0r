@@ -281,6 +281,59 @@ class AIBusinessPolicy(models.Model):
         default=False, help_text='Both the processor and the model must be on-premises.')
     daily_budget_cents = models.PositiveIntegerField(
         default=0, help_text='Spend ceiling per day across all AI runs, in cents. 0 = no spend.')
+    history_retention_days = models.PositiveIntegerField(
+        null=True, blank=True,
+        help_text='Days to keep this customer\'s ticket AI and automation history (AI drafts, analysis jobs, '
+                  'RMM requests and the decisions on them). Blank = the installation default '
+                  '(PSA_AI_HISTORY_RETENTION_DAYS, 365). 0 = keep until deleted by hand.')
+
+    # --- tenant exclusion (every AI feature, enforced in profiles.profile_refusal
+    # and therefore inside the gateway too) ---------------------------------------
+    ai_excluded = models.BooleanField(
+        default=False, help_text='Exclude this customer from every AI feature, whatever else is set here.')
+
+    # --- AI Troubleshoot (OPTIONAL AI; services/troubleshoot.py) -----------------
+    ROUTE_PRIMARY, ROUTE_FALLBACK, ROUTE_LOCAL_FIRST, ROUTE_CHEAPEST = 'primary', 'fallback', 'local_first', 'cheapest'
+    ROUTING_CHOICES = [
+        (ROUTE_PRIMARY, 'Primary model only'),
+        (ROUTE_FALLBACK, 'Primary, then the secondary model if the primary is unusable or fails'),
+        (ROUTE_LOCAL_FIRST, 'Prefer an approved on-premises model of the two'),
+        (ROUTE_CHEAPEST, 'Prefer the cheaper of the two'),
+    ]
+    troubleshoot_enabled = models.BooleanField(
+        default=False, help_text='Allow AI Troubleshoot on this customer\'s tickets and devices.')
+    primary_profile = models.ForeignKey(
+        AIModelProfile, null=True, blank=True, on_delete=models.SET_NULL, related_name='+',
+        help_text='Troubleshoot: primary model. Blank = the policy default / economical model.')
+    secondary_profile = models.ForeignKey(
+        AIModelProfile, null=True, blank=True, on_delete=models.SET_NULL, related_name='+',
+        help_text='Troubleshoot: secondary model (fallback, or the second opinion in multi-model analysis).')
+    multi_model_enabled = models.BooleanField(
+        default=False, help_text='Troubleshoot: allow running primary and secondary side by side and comparing.')
+    model_routing = models.CharField(max_length=12, choices=ROUTING_CHOICES, default=ROUTE_PRIMARY)
+    monthly_budget_cents = models.PositiveIntegerField(
+        null=True, blank=True,
+        help_text='Spend ceiling per calendar month across all AI runs, in cents. Blank = no monthly ceiling '
+                  '(the daily ceiling still applies).')
+    troubleshoot_daily_runs = models.PositiveIntegerField(
+        default=50, help_text='Troubleshoot runs per day for this customer, all technicians together. 0 = none.')
+    troubleshoot_technician_daily_runs = models.PositiveIntegerField(
+        default=20, help_text='Troubleshoot runs per day per technician at this customer. 0 = none.')
+
+    # --- information-sharing rules: what may leave for a model -------------------
+    # Enforced in services/troubleshoot.build_observations before any prompt
+    # text exists; what was withheld is listed on the preview and the session.
+    share_ticket_text = models.BooleanField(
+        default=True, help_text='Ticket subject, description and public conversation.')
+    share_device_data = models.BooleanField(
+        default=True, help_text='Device name, OS, RMM status, alerts and read-only diagnostic output.')
+    share_network_identifiers = models.BooleanField(
+        default=False, help_text='Hostnames, IP and MAC addresses. Off = replaced with placeholders.')
+    share_contact_data = models.BooleanField(
+        default=False, help_text='Contact and requester names. Off = replaced with [contact].')
+    share_kb_titles = models.BooleanField(
+        default=True, help_text='Titles of this customer\'s and global KB articles and runbooks, so the model '
+                                'can point at relevant ones.')
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
@@ -323,6 +376,10 @@ class AnalysisJob(models.Model):
         ('expired', 'Expired'),
     ]
     TERMINAL = {'completed', 'partial', 'failed', 'unavailable', 'expired'}
+    PROTOCOL_HMAC = 'hmac'
+    PROTOCOL_REM0TE = 'rem0te-ed25519'
+    PROTOCOL_CHOICES = [(PROTOCOL_HMAC, 'ticket-rmm-v1 (HMAC pairing)'),
+                        (PROTOCOL_REM0TE, "ticket-rmm-v1 (Rem0te's Ed25519 protocol)")]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     organization = models.ForeignKey('core.Organization', on_delete=models.CASCADE, related_name='+')
@@ -350,6 +407,13 @@ class AnalysisJob(models.Model):
     last_polled_at = models.DateTimeField(null=True, blank=True)
     error = models.TextField(blank=True, default='')
     disagreements = models.JSONField(default=list, blank=True)
+    # Rem0te (Ed25519) jobs: the exact job request sent (canonical, defaults
+    # applied — its sha256 is what the delegation token is bound to), and
+    # Rem0te's signed, staff-only result.
+    protocol = models.CharField(max_length=20, choices=PROTOCOL_CHOICES, default=PROTOCOL_HMAC)
+    processor_request = models.JSONField(default=dict, blank=True)
+    processor_result = models.JSONField(default=dict, blank=True)
+    processor_error_code = models.CharField(max_length=64, blank=True, default='')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -390,6 +454,12 @@ class AnalysisRun(models.Model):
     output_tokens = models.PositiveIntegerField(default=0)
     result = models.JSONField(default=dict, blank=True)
     error = models.CharField(max_length=500, blank=True, default='')
+    # What actually ran, recorded when the gateway executes the run: the
+    # provider/model the profile named at that moment (profiles can be
+    # edited later) and the system prompt's stable version (file name +
+    # content hash, services/prompt_versions.py). Blank = never executed.
+    resolved_model = models.CharField(max_length=150, blank=True, default='')
+    prompt_version = models.CharField(max_length=80, blank=True, default='')
     started_at = models.DateTimeField(null=True, blank=True)
     finished_at = models.DateTimeField(null=True, blank=True)
 
@@ -489,6 +559,20 @@ class RMMRequest(models.Model):
     result_bytes = models.PositiveIntegerField(default=0)
     result_truncated = models.BooleanField(default=False)
     confirmed_at = models.DateTimeField(null=True, blank=True)
+    # Rem0te action proposals: where Rem0te's approvers approve (shown, never
+    # acted on here), and Rem0te's own status word.
+    approval_url = models.URLField(max_length=500, blank=True, default='')
+    remote_status = models.CharField(max_length=40, blank=True, default='')
+    # Rem0te's own answer about approval and outcome, as last reported
+    # (integrations/rem0te/actions.py). Shown in the ticket's AI and
+    # automation history; never acted on here.
+    approvals_required = models.PositiveSmallIntegerField(null=True, blank=True)
+    customer_signoff = models.BooleanField(null=True, blank=True)
+    approval_expires_at = models.DateTimeField(
+        null=True, blank=True, help_text="End of Rem0te's approval/execution window (window.not_after).")
+    remote_outcome = models.CharField(max_length=20, blank=True, default='')
+    observed = models.JSONField(default=dict, blank=True,
+                                help_text="Rem0te's observed result, sanitised and size-limited.")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -521,3 +605,306 @@ class RMMRequestEvent(models.Model):
         db_table = 'psa_ai_rmm_request_events'
         unique_together = [('request', 'event_id')]
         ordering = ['pk']
+
+
+# ===========================================================================
+# Rem0te monitoring alerts → tickets (contract ticket-rmm-v1, Rem0te ≥ 0.29).
+# integrations/rem0te/alerts.py has the rules.
+# ===========================================================================
+
+class Rem0teAlertEvent(models.Model):
+    """A signed alert event received from Rem0te (pushed or polled), kept for
+    de-duplication, gap detection and audit."""
+    connection = models.ForeignKey('integrations.RMMConnection', on_delete=models.CASCADE, related_name='+')
+    event_id = models.CharField(max_length=64)
+    sequence = models.PositiveIntegerField()
+    event_type = models.CharField(max_length=20)
+    alert_id = models.CharField(max_length=64)
+    body = models.JSONField(default=dict)
+    received_via = models.CharField(max_length=8, default='push')
+    received_at = models.DateTimeField(auto_now_add=True)
+    # False: authentic (signature verified) but not applied — e.g. a shape
+    # this ClientSt0r does not understand. Kept so the gap-free cursor moves
+    # on, shown on the connection's health, and re-tried by reconciliation
+    # after the next successful capabilities check.
+    applied = models.BooleanField(default=True)
+    problem = models.CharField(max_length=300, blank=True, default='')
+
+    class Meta:
+        db_table = 'psa_ai_rem0te_alert_events'
+        constraints = [
+            models.UniqueConstraint(fields=['connection', 'event_id'], name='psa_ai_rem0te_alert_event_once'),
+        ]
+        indexes = [models.Index(fields=['connection', 'sequence'])]
+
+
+class Rem0teAlertTicket(models.Model):
+    """The one ticket opened for one Rem0te alert. The unique constraint is
+    what makes `alert.raised` → exactly one ticket, however often the event
+    is pushed, polled or retried, and across restarts."""
+    LINK_PENDING, LINK_LINKED, LINK_CONFLICT, LINK_FAILED = 'pending', 'linked', 'conflict', 'failed'
+    LINK_CHOICES = [(LINK_PENDING, 'Not linked in Rem0te yet'), (LINK_LINKED, 'Linked in Rem0te'),
+                    (LINK_CONFLICT, 'Rem0te has another ticket for this alert'), (LINK_FAILED, 'Link failed')]
+    connection = models.ForeignKey('integrations.RMMConnection', on_delete=models.CASCADE, related_name='+')
+    organization = models.ForeignKey('core.Organization', on_delete=models.CASCADE, related_name='+')
+    alert_id = models.CharField(max_length=64)
+    ticket = models.ForeignKey('psa.Ticket', null=True, blank=True, on_delete=models.SET_NULL,
+                               related_name='rem0te_alerts')
+    rem0te_endpoint_id = models.CharField(max_length=64, blank=True, default='')
+    computer_name = models.CharField(max_length=128, blank=True, default='')
+    kind = models.CharField(max_length=20, blank=True, default='')
+    severity = models.CharField(max_length=10, blank=True, default='')
+    state = models.CharField(max_length=15, blank=True, default='')
+    title = models.CharField(max_length=300, blank=True, default='')
+    last_sequence = models.PositiveIntegerField(default=0)
+    link_status = models.CharField(max_length=10, choices=LINK_CHOICES, default=LINK_PENDING)
+    link_error = models.CharField(max_length=300, blank=True, default='')
+    link_attempts = models.PositiveIntegerField(default=0)
+    next_link_at = models.DateTimeField(null=True, blank=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    # Contract revision 2: Rem0te's redacted patch summary of the computer on
+    # a REBOOT_PENDING alert (KB numbers, states, ages, labels only), as of
+    # the latest event. Empty for other alerts and revision-1 peers.
+    patch_summary = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'psa_ai_rem0te_alert_tickets'
+        constraints = [
+            models.UniqueConstraint(fields=['connection', 'alert_id'], name='psa_ai_rem0te_alert_one_ticket'),
+        ]
+
+
+# ===========================================================================
+# Ticket AI and automation history (staff only). services/history.py builds
+# the timeline; these rows hold what no other model records.
+# ===========================================================================
+
+class AIDraftDecision(models.Model):
+    """What a technician did with an AI draft: recorded by the server when a
+    comment that came from an AI draft is posted (or refused). The marker the
+    composer sends is only a hint; the draft is resolved against this
+    ticket's own suggestions and analysis jobs (services/drafts.py)."""
+    SOURCE_SUGGESTION = 'suggestion'
+    SOURCE_ANALYSIS = 'analysis'
+    SOURCE_REM0TE = 'rem0te'
+    SOURCE_CHOICES = [(SOURCE_SUGGESTION, 'AI reply suggestion'), (SOURCE_ANALYSIS, 'Ticket analysis draft'),
+                      (SOURCE_REM0TE, "Rem0te's verified draft")]
+    SENT = 'sent'
+    SENT_EDITED = 'sent_edited'
+    KEPT_INTERNAL = 'kept_internal'
+    SEND_REFUSED = 'send_refused'
+    DECISION_CHOICES = [
+        (SENT, 'Sent to the customer unchanged'),
+        (SENT_EDITED, 'Edited, then sent to the customer'),
+        (KEPT_INTERNAL, 'Kept as an internal note'),
+        (SEND_REFUSED, 'Send refused (no permission to send AI-assisted replies)'),
+    ]
+
+    organization = models.ForeignKey('core.Organization', on_delete=models.CASCADE, related_name='+')
+    ticket = models.ForeignKey('psa.Ticket', on_delete=models.CASCADE, related_name='ai_draft_decisions')
+    source = models.CharField(max_length=12, choices=SOURCE_CHOICES)
+    suggestion = models.ForeignKey(AISuggestion, null=True, blank=True, on_delete=models.CASCADE,
+                                   related_name='draft_decisions')
+    job = models.ForeignKey(AnalysisJob, null=True, blank=True, on_delete=models.CASCADE,
+                            related_name='draft_decisions')
+    draft_index = models.PositiveSmallIntegerField(null=True, blank=True)
+    decision = models.CharField(max_length=14, choices=DECISION_CHOICES)
+    comment = models.ForeignKey('psa.TicketComment', null=True, blank=True, on_delete=models.SET_NULL,
+                                related_name='+')
+    actor = models.ForeignKey(django_settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL,
+                              related_name='+')
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        db_table = 'psa_ai_draft_decisions'
+        ordering = ['created_at', 'pk']
+        indexes = [models.Index(fields=['ticket', 'created_at'])]
+
+    def __str__(self):
+        return f'{self.get_decision_display()} ({self.source}) on ticket {self.ticket_id}'
+
+
+class AIHistoryPurgeState(models.Model):
+    """One row (pk=1): when the AI and automation history was last purged,
+    so the every-minute poll_analysis_jobs task purges at most every few hours."""
+    last_run_at = models.DateTimeField(null=True, blank=True)
+    last_deleted = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        db_table = 'psa_ai_history_purge_state'
+
+
+class AIBudgetMonth(models.Model):
+    """Per-organization spend for one calendar month, in 1/100 cent. Kept by
+    services/budget.py next to AIBudgetDay with the same conditional UPDATE,
+    so AIBusinessPolicy.monthly_budget_cents can't be overshot either."""
+    organization = models.ForeignKey('core.Organization', on_delete=models.CASCADE, related_name='+')
+    month = models.DateField(help_text='First day of the month.')
+    reserved = models.PositiveBigIntegerField(default=0)
+    spent = models.PositiveBigIntegerField(default=0)
+
+    class Meta:
+        db_table = 'psa_ai_budget_months'
+        unique_together = [('organization', 'month')]
+
+
+# ===========================================================================
+# AI Troubleshoot (OPTIONAL AI, gated by psa_ai_enabled; services/troubleshoot.py).
+#
+# Four layers, never mixed, in storage as in the UI:
+#   Observation        TroubleshootSession.observations — data with its source
+#                      and freshness, filtered by the sharing rules
+#   AI inference       TroubleshootRun.result — labelled with model + prompt version
+#   Technician action  TroubleshootActionLink → the RMMRequest the technician
+#                      created through the normal request/approval flow
+#   Verified result    that RMMRequest's signed outcome from the RMM
+# The AI never executes anything and never calls an RMM.
+# ===========================================================================
+
+class TroubleshootSession(models.Model):
+    STATUS_CHOICES = [
+        ('running', 'Running'),
+        ('completed', 'Completed'),
+        ('partial', 'Completed with some models failing'),
+        ('failed', 'Failed'),
+    ]
+    TERMINAL = {'completed', 'partial', 'failed'}
+    MODE_SINGLE, MODE_MULTI = 'single', 'multi'
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization = models.ForeignKey('core.Organization', on_delete=models.CASCADE, related_name='+')
+    ticket = models.ForeignKey('psa.Ticket', null=True, blank=True, on_delete=models.CASCADE,
+                               related_name='ai_troubleshoot_sessions')
+    device = models.ForeignKey('integrations.RMMDevice', null=True, blank=True, on_delete=models.SET_NULL,
+                               related_name='+')
+    actor = models.ForeignKey(django_settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='+')
+    mode = models.CharField(max_length=8, choices=[(MODE_SINGLE, 'One model'), (MODE_MULTI, 'Multi-model')])
+    routing = models.CharField(max_length=12, blank=True, default='')
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='running')
+    observations = models.JSONField(default=dict, help_text='Redacted observations exactly as sent.')
+    observations_digest = models.CharField(max_length=64)
+    sharing = models.JSONField(default=dict, blank=True,
+                               help_text='The sharing rules applied, and what was withheld.')
+    comparison = models.JSONField(default=dict, blank=True)
+    idempotency_key = models.CharField(max_length=64)
+    error = models.CharField(max_length=500, blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'psa_ai_troubleshoot_sessions'
+        ordering = ['-created_at']
+        constraints = [
+            models.UniqueConstraint(fields=['actor', 'idempotency_key'], name='psa_ai_troubleshoot_idempotency'),
+        ]
+        indexes = [models.Index(fields=['ticket', '-created_at']), models.Index(fields=['device', '-created_at']),
+                   models.Index(fields=['organization', 'created_at'])]
+
+    def __str__(self):
+        return f'TroubleshootSession {self.id} ({self.status})'
+
+    @property
+    def is_terminal(self):
+        return self.status in self.TERMINAL
+
+
+class TroubleshootRun(models.Model):
+    """One model's inference inside a session. `result` is the validated
+    structure from services/troubleshoot_result.py, never raw model text."""
+    ROLE_CHOICES = [('primary', 'Primary'), ('secondary', 'Secondary'), ('fallback', 'Fallback')]
+    session = models.ForeignKey(TroubleshootSession, on_delete=models.CASCADE, related_name='runs')
+    profile = models.ForeignKey(AIModelProfile, on_delete=models.PROTECT, related_name='+')
+    role = models.CharField(max_length=10, choices=ROLE_CHOICES, default='primary')
+    status = models.CharField(max_length=10, choices=AnalysisRun.STATUS_CHOICES, default='pending')
+    reserved_cost = models.PositiveIntegerField(default=0, help_text='1/100 cent')
+    actual_cost = models.PositiveIntegerField(default=0)
+    input_tokens = models.PositiveIntegerField(default=0)
+    output_tokens = models.PositiveIntegerField(default=0)
+    result = models.JSONField(default=dict, blank=True)
+    error = models.CharField(max_length=500, blank=True, default='')
+    resolved_model = models.CharField(max_length=150, blank=True, default='')
+    prompt_version = models.CharField(max_length=80, blank=True, default='')
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = 'psa_ai_troubleshoot_runs'
+        unique_together = [('session', 'profile')]
+        ordering = ['pk']
+
+
+class TroubleshootActionLink(models.Model):
+    """A suggested action a technician chose to request, and the RMMRequest
+    it created through the normal request/approval flow. The AI suggestion
+    authorises nothing; this row only records that a person asked."""
+    session = models.ForeignKey(TroubleshootSession, on_delete=models.CASCADE, related_name='action_links')
+    action_ref = models.CharField(max_length=20, help_text='The action ID in the session observations (X1, X2…).')
+    action_key = models.CharField(max_length=100)
+    rmm_request = models.ForeignKey(RMMRequest, null=True, blank=True, on_delete=models.SET_NULL,
+                                    related_name='troubleshoot_links')
+    requested_by = models.ForeignKey(django_settings.AUTH_USER_MODEL, null=True, blank=True,
+                                     on_delete=models.SET_NULL, related_name='+')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'psa_ai_troubleshoot_action_links'
+        ordering = ['created_at', 'pk']
+
+
+# ===========================================================================
+# Installation-wide AI settings (superusers; psa_ai/profile_views.py).
+# ===========================================================================
+
+class AIInstallationSettings(models.Model):
+    """One row (pk=1): settings that apply across every customer.
+
+    monthly_budget_cents caps what the whole installation spends on AI in a
+    calendar month, on top of each customer's own daily and monthly ceilings
+    (services/budget.reserve takes all of them in the same reservation).
+    command_allowlist narrows the read-only commands AI Troubleshoot may show
+    (services/troubleshoot_result); the built-in denylist always applies."""
+    monthly_budget_cents = models.PositiveIntegerField(
+        null=True, blank=True,
+        help_text='Spend cap per calendar month for the whole installation, all customers together, in cents. '
+                  'Blank = no installation-wide cap (each customer\'s own ceilings still apply).')
+    command_allowlist = models.TextField(
+        blank=True,
+        help_text='AI Troubleshoot: read-only command patterns, one per line (* matches anything, ? one '
+                  'character; case-insensitive; lines starting with # are comments). When any are set, a '
+                  'suggested command is kept only if it matches one. The built-in denylist of commands that '
+                  'change a system always applies. Commands are only ever shown as text.')
+    updated_by = models.ForeignKey(django_settings.AUTH_USER_MODEL, null=True, blank=True,
+                                   on_delete=models.SET_NULL, related_name='+')
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'psa_ai_installation_settings'
+
+    def __str__(self):
+        return 'AI installation settings'
+
+    @classmethod
+    def load(cls):
+        from django.db import IntegrityError, transaction
+        row = cls.objects.filter(pk=1).first()
+        if row is None:
+            try:
+                with transaction.atomic():
+                    row = cls.objects.create(pk=1)
+            except IntegrityError:
+                row = cls.objects.get(pk=1)
+        return row
+
+
+class AIBudgetInstallMonth(models.Model):
+    """Installation-wide spend for one calendar month, in 1/100 cent, kept by
+    services/budget.py with the same conditional UPDATE as AIBudgetMonth so
+    AIInstallationSettings.monthly_budget_cents can't be overshot."""
+    month = models.DateField(unique=True, help_text='First day of the month.')
+    reserved = models.PositiveBigIntegerField(default=0)
+    spent = models.PositiveBigIntegerField(default=0)
+
+    class Meta:
+        db_table = 'psa_ai_budget_install_months'

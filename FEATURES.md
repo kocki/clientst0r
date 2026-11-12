@@ -174,6 +174,7 @@ created from the customer portal are shared automatically).
 | Parent / child organizations | Available | A parent organization sees its children's records. | Organization edit page |
 | Per-organization branding | Limited | Each organization can have a logo (used in the customer portal) and a portal accent colour. Site name, logo and background are install-wide. | Organization edit page |
 | MSP staff global access | Available | Staff see all organizations, limited by their global role. | Organization switcher |
+| Customer operations page | Available | One page per customer: SLA risks (open tickets breached or near their SLA), uptime incidents (down or warning monitors, outages in the last 7 days, status-page incidents), contract renewals (ending within 60 days or ended and not renewed), overdue invoices with the outstanding balance, and aging assets (warranty, vendor end of support / end of life, and age when asset age warnings are on). Each row links to where the work is done: open ticket, renew / edit contract, open invoice and send reminder, open asset, plan replacement (a new ticket prefilled with the asset). Sections and totals follow the user's role for that customer (`tickets_view`, `monitoring_view`, `billing_view_invoices` or `reports_view_financial` for renewals, `billing_view_invoices` for invoices, `assets_view`); a section the role doesn't include is not computed. Customer users see only their own customer, only tickets shared with them and only published incidents, and get no links into staff-only pages. PSA sections need PSA on; uptime needs Monitoring on. Rows checked per section are capped (500; 2,000 assets) and the page says when the cap is hit. | `/core/customers/<id>/operations/`, Operations button on the customer page, client switcher |
 
 ### Roles and permissions
 
@@ -182,10 +183,12 @@ created from the customer portal are shared automatically).
 | Built-in roles: Owner, Admin, Editor, Read-Only | Available | | Members page |
 | Custom roles | Available | Around a hundred individual permission switches, grouped by area. | `/accounts/roles/` |
 | **View passwords / View documents / View assets** | Available | Enforced since v3.17.600 everywhere those records appear: vault, documents and assets pages, global search (with real totals), dashboards, REST and GraphQL APIs, mobile app and browser extension. Contacts follow View assets. A user's personal vault is unaffected. The ticket sidebar's credential card follows View passwords and shows titles only. | `/accounts/roles/` |
-| **View files / View monitors / View integrations** | Planned | Saved but not enforced; the role editor marks each "(not enforced yet)". | `/accounts/roles/` |
+| **View files / View monitors / View integrations** | Shipped v3.17.664 | Enforced per customer on `/files/`, `/monitoring/` and `/integrations/`, global search (synced PSA companies and contacts), dashboards, GraphQL monitors and expirations, the mobile dashboard, and the navbar. Attachment lists on asset and rack pages follow View files. Upgrading switches View monitors and View integrations on for every existing role, so nobody loses access. | `/accounts/roles/` |
 | Vault export permission | Planned | Marked "Not yet implemented" in the role editor. | — |
 | Document publish permissions | Available | Since v3.17.605 publishing needs View/Publish documents for that customer (or Publish KB articles for global articles); without it, new documents, uploads and imports save as drafts. | Document form |
 | Role assignment limits | Available | A role can be assigned only if it is a system role or the organization's own custom role. | Members page |
+| Technician access (ticket AI and RMM tools) | Available | Since v3.17.646. L1/L2/L3 presets per technician or group, per customer, with expiry; customer restrictions, denies, protected changes for anything that widens access. See [TECHNICIAN_ACCESS.md](docs/TECHNICIAN_ACCESS.md). | Settings → Security → Technician Access |
+| Why a technician can do something | Available | For a technician, customer and capability: the outcome and every source behind it at that customer (assignments active, expired and revoked; group membership; denies; customer restriction; paired RMM; technician standing and superuser grant; membership role), who granted each and when, expiry, links to the assignment record and the approving protected change, and audit history with before/after. Security administrators only; no other customer's rows. Before/after values exist on audit entries written since this release. | `/settings/security/technician-access/why/` |
 
 ### Users
 
@@ -263,6 +266,7 @@ created from the customer portal are shared automatically).
 | Pre-written KB content | Limited | Not installed by default; an administrator imports it. | `/core/settings/kb-import/` |
 | Diagrams (draw.io) | Available | With previews and templates. | `/docs/diagrams/` |
 | Export | Available | Markdown, HTML, DOCX and PDF, single or bulk. | Document detail → Export |
+| Agreements: MSAs, SOWs, policy acknowledgments | Available | A customer document (HTML or Markdown) can be made an agreement: drawn signature or "I have read and accept" acknowledgment, by one person for the customer or by every portal user. Each signature binds to an exact issued version — version number, content SHA-256, the rendered body, an HTML snapshot and (when it renders) a PDF — plus signer name, e-mail, account, time, IP address and browser. Editing the live document issues a new version that needs a new signature; drafts awaiting approval are never issued. Earlier versions, their signers and their evidence stay unchanged and downloadable (ZIP with snapshot, PDF, content.json, evidence.json and SHA256SUMS, each hash checkable with `sha256sum`). Staff see who signed which version and who is outstanding. Signature records can't be edited or deleted and outlive the document. Uploaded-file documents can't be agreements yet. | Document → **Agreement**, Docs → Agreements (`/docs/lifecycle/agreements/`) |
 | File attachments on documents | Planned | | — |
 | Document favorites | Planned | Favorites exist for assets, passwords and some other records. | `/core/favorites/` |
 | Share links | Planned | | — |
@@ -427,9 +431,27 @@ The built-in service desk is off until an administrator turns on `psa_enabled`
 |---|---|---|---|
 | Triggers | Available | Ticket created / updated, status changed, comment added, SLA threshold crossed. | `/psa/rules/` |
 | MSP-wide or per-client rules | Available | | Rule form |
-| Visual rule builder | Limited | Six actions in the builder (priority, queue, assign, watcher, internal note, tag). Round-robin / skill / load-balanced assignment, charges and rule chaining are available only in raw JSON. | `/psa/rules/new/` |
+| Visual rule builder | Limited | Nine actions in the builder: priority, queue, assign, watcher, internal note, tag, and round-robin / skill-group / least-loaded assignment. Charges and rule chaining are available only in raw JSON; a rule using them opens in raw JSON so saving never drops them. | `/psa/rules/new/` |
 | Rule chaining safety | Limited | No guard against one rule re-triggering another in a loop; avoid circular `fire_rule` chains. | — |
 | Per-rule last fired / count / error, sample rules | Available | | `/psa/rules/templates/` |
+
+### Ticket routing
+
+Optional, not AI, Off on fresh installs and upgrades. Guide: [docs/TICKET_ROUTING.md](docs/TICKET_ROUTING.md).
+
+| Capability | Status | Notes | Where |
+|---|---|---|---|
+| Modes | Available | Off / Suggest only / Automatic. MSP-wide default; each customer inherits or overrides. With Off, intake, catalog defaults, manual assignment and workflow rules are unchanged. | `/psa/settings/` card, `/psa/routing/` |
+| Rule conditions | Available | Customer, intake source, ticket type, priority, queue, tags, subject/description words, catalog service, contract (has / type), business hours or after hours, SLA risk. Site is not available (tickets have no site link). | `/psa/routing/rules/new/` |
+| Destinations | Available | Queue only, named technician, team, round-robin, skill match (Resourcing skills), least-loaded. Optional team, on-call and availability filters. Fallback: a queue, or unassigned in Triage. | Rule form |
+| Review, conflicts, versions | Available | Plain-language summary and conflict check before saving; blocking problems prevent activation; every save is a new version. Saving never reassigns existing tickets. | Rule review |
+| Candidates | Available | Active MSP technicians with ticket access at the customer; optional per-customer technician list; contained or explicitly denied technicians excluded; leave, working hours and on-call honoured. Skipped technicians are recorded with reasons. | — |
+| Triggers | Available | On creation (every intake path); reroute on customer reply, reopen and SLA threshold, each optional. Manual assignments preserved by default; loop guard. | `/psa/routing/` |
+| Test routing | Available | Dry run for an authorized existing ticket or a sample: winning rule, rules skipped and why, skipped candidates, destination, reason. Changes nothing, sends nothing. | `/psa/routing/test/` |
+| History and suggestions | Available | Staff-only routing panel on the ticket (rule version, trigger, previous and new assignment, reason, manual overrides); Accept / Dismiss for suggestions; Triage list for fallbacks. Never shown in the portal. | Ticket page, `/psa/routing/triage/` |
+| Duplicates and concurrency | Available | One routing pass per ticket and trigger (unique claim); round-robin turns reserved under a lock; a repeated e-mail Message-ID is ignored by the poller. | — |
+| Permissions | Available | Separate role flags: manage rules, test routing, accept/reject suggestions. MSP technicians only. Routing never changes the customer, the SLA clock or access, and never starts a remote session or endpoint action. | `/accounts/roles/` |
+| Business hours per customer | Not built | One MSP-wide business-hours definition (plus Resourcing holidays). | — |
 
 ### Contracts, quotes and invoices
 
@@ -460,6 +482,7 @@ The built-in service desk is off until an administrator turns on `psa_enabled`
 | Knowledge base | Available | Client-visible articles. | `/portal/kb/` |
 | Attachments | Limited | Internal attachments can't be downloaded; attachments on internal comments may still be listed by name. | Portal ticket |
 | Credentials | Available | See [Password vault](#password-vault). | `/portal/vault/` |
+| Agreements | Available | Portal users read the current version of their own customer's agreements and sign or acknowledge it, and download the evidence of every signature made for their customer. Another customer's agreements return 404. A version changed while the signer was reading is refused and shown again. See [Documentation](#documentation). | `/portal/agreements/` |
 | Branding | Available | The client's logo. | `/portal/` |
 
 ### Distributors
@@ -587,6 +610,20 @@ Connect a third-party PSA to mirror its data. Separate from the built-in service
 | Device map | Limited | Only Tactical RMM supplies coordinates. | Dashboard |
 | Organization auto-import | Available | | `/integrations/rmm/<id>/map-organizations/` |
 
+### RMM technician workspace
+
+| Capability | Status | Notes | Where |
+|---|---|---|---|
+| Rem0te contract revision 2 (Ed25519 pairing) | Shipped v3.17.664 | Tested against a real Rem0te 0.30.1 (99/102 checks; job-across-restart case pending). Released versions pair Rem0te over HMAC. | `/integrations/rmm/rem0te/setup/` |
+| Device Workspace | Shipped v3.17.664 | Stored RMM data with source and age per fact; unsupported fields shown as such; Refresh from RMM once per device every 5 minutes. | `/assets/workspace/` |
+| Service lists | Shipped v3.17.664 | Tactical RMM only, opt-in per connection, kept 14 days. | RMM connection → Edit |
+| Ticket RMM panel | Shipped v3.17.664 | Affected devices, health, read-only diagnostics, verify-then-close. | Ticket page |
+| L1 / L2 / L3 RMM permission levels | Shipped v3.17.664 | One server-side check for every RMM action; second-person approvals; level changes need two administrators. | `/settings/security/rmm-permissions/` |
+| Alert-to-ticket policy | Shipped v3.17.664 | Off (one ticket per Rem0te alert) until switched on. | `/psa/routing/alerts/` |
+| One-click support workflows | Shipped v3.17.664 | Twelve built-ins; RMM remediation only where the RMM advertises it, with approval. | `/psa/workflows/` |
+| AI Troubleshoot (**OPTIONAL AI**) | Shipped v3.17.664 | Needs `psa_ai_enabled` and the customer's AI policy; suggestions are text only. | Ticket page, Device Workspace |
+| Software sync for NinjaOne, Datto RMM, Atera, ConnectWise Automate | Shipped v3.17.663 | Earlier versions failed to sync software for these four (an argument error). A failed read keeps the stored list. | RMM connection |
+
 ---
 
 ## Notifications
@@ -645,6 +682,7 @@ All AI features are optional. Nothing calls an AI provider until one is configur
 | Documentation generate / enhance / validate | Available | Uses the configured provider: Anthropic, OpenAI, Moonshot, MiniMax, or a local Ollama model. | `/docs/ai/assistant/` |
 | Ticket reply drafts and suggested actions | Limited | Human approval before anything is sent or applied; guardrails (rate limits, token quotas, input sanitising, action allowlist); vault secrets never sent. Uses Anthropic only. | `/psa/ai/inbox/` |
 | Ticket triage suggestions | Limited | Advisory only. Anthropic only. | Ticket detail |
+| Ticket AI and automation history | Available | Since v3.17.660. One staff-only, chronological timeline per ticket: AI drafts, suggested changes and analysis jobs (model/profile actually run, prompt version as file name + content hash, who accepted, edited, rejected or sent a draft and when), approval requirement and expiry for suggested changes, fix referrals and Rem0te action proposals, Rem0te outcome (job status and error code, proposal status and observed result), alert tickets, and routing decisions marked as never starting a remote session or endpoint action. Technicians with access at the customer only; AI entries need AI output access; with AI off the recorded entries stay as metadata without AI text. Never in the portal. Redacted text only; prompts, evidence and keys are never shown. Per-customer retention (default 365 days, `PSA_AI_HISTORY_RETENTION_DAYS`) purged by the `poll_analysis_jobs` task. Reads stored rows only; contacts no RMM or provider. See [TECHNICIAN_ACCESS.md](docs/TECHNICIAN_ACCESS.md#ai-and-automation-history). | Ticket detail, `/psa/ai/assist/<ticket>/history/` |
 | AI role permissions | Available | 12 switches (view, request triage, send, approve, apply by risk tier, scripts, workflows, billing, admin). | `/accounts/roles/` |
 | Receipt scanning | Limited | See [Service vehicles](#service-vehicles); gated by `psa_ai_enabled` since v3.17.609. | `/vehicles/receipts/quick/` |
 | Redaction of personal data before sending | Planned | The redaction code exists but is not called. | — |
@@ -670,6 +708,7 @@ All AI features are optional. Nothing calls an AI provider until one is configur
 |---|---|---|---|
 | General, security, SMTP, SMS, directory, AI settings | Available | Since v3.17.610 saved Security settings (session, 2FA, lockout, password policy) take effect; an environment variable, if set, wins and the field shows "set by environment". Settings → Directory configures Azure AD SSO and LDAP, with a **Test connection** button for LDAP. See [Authentication](#authentication-and-sessions). | `/core/settings/`, `/core/settings/security/`, `/core/settings/directory/` |
 | Feature toggles | Limited | Install-wide (not per organization): service desk, AI, vehicles, workflows, monitoring, reports and others. Several only hide the menu. | `/core/settings/features/` |
+| Optional modules page | Available | Every optional module on one page: on / off (or "on, not working" when something it needs is off), what it needs, what people see when it is on, its default, and links to its settings. Switches the SystemSetting-backed modules (PSA, Ticket AI, CRM, monitoring, workflows, inventory, scheduling, vehicles, webhooks, global KB, CSAT, portal announcements / voting / escalation / approvals, asset age warnings, warranty and firmware checks); routing, the per-customer portal and status pages link to their own pages. Turning a module on while a required module is off is refused; turning one off warns which modules stop working and leaves their own switch alone. Changes are audit-logged. Also lists switches that are saved but not read by anything yet (the global portal, anonymous form, email-to-ticket, SMS, desktop alert and external alert ingest switches on PSA settings; Reports and Secure Notes on Feature toggles). No defaults changed. Superusers only. | `/core/settings/modules/` |
 | Scheduler | Available | See [Scheduled jobs](#scheduled-jobs). | `/core/settings/scheduler/` |
 | System updates | Available | Check and apply from the web UI; graceful reload. See [AUTO_UPDATE.md](AUTO_UPDATE.md). | `/core/settings/updates/` |
 | Database maintenance | Limited | Clear sessions, prune audit logs, optimize and analyze tables. Backup and restore are command-line only. | `/core/settings/maintenance/` |

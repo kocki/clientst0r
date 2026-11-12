@@ -15,12 +15,31 @@ from . import webhook_views
 from . import security_views
 from . import help_views
 from . import client_switcher
+from . import customer_ops_views
+from . import modules_views
+from . import workspace
 
 app_name = 'core'
 
 urlpatterns = [
     path('clients/switcher-search/', client_switcher.client_switcher_search, name='client_switcher_search'),
     path('dashboard/', dashboard_views.dashboard, name='dashboard'),
+    # Technician workspace (core/workspace.py): open a device in its customer's
+    # context, return from it, saved list views, recent devices.
+    path('open/<slug:kind>/<int:pk>/', workspace.open_device, name='open_device'),
+    path('context/return/', workspace.context_return, name='context_return'),
+    path('views/save/', workspace.saved_view_save, name='saved_view_save'),
+    path('views/<int:pk>/default/', workspace.saved_view_default, name='saved_view_default'),
+    path('views/<int:pk>/delete/', workspace.saved_view_delete, name='saved_view_delete'),
+    path('recent-devices.json', workspace.recent_devices_json, name='recent_devices_json'),
+    # Customer operations: SLA risks, uptime, renewals, overdue invoices,
+    # aging assets for one customer (core/customer_ops.py).
+    path('customers/operations/', customer_ops_views.customer_ops_current, name='customer_ops_current'),
+    path('customers/<int:org_id>/operations/', customer_ops_views.customer_ops, name='customer_ops'),
+    path('customers/<int:org_id>/operations/invoices/<int:invoice_id>/reminder/',
+         customer_ops_views.invoice_reminder, name='customer_ops_invoice_reminder'),
+    path('customers/<int:org_id>/operations/<slug:section>/', customer_ops_views.customer_ops_section,
+         name='customer_ops_section'),
     path('global-dashboard/', dashboard_views.global_dashboard, name='global_dashboard'),
     path('documentation/', views.documentation, name='documentation'),
     path('about/', views.about, name='about'),
@@ -138,6 +157,7 @@ urlpatterns = [
     path('settings/general/', settings_views.settings_general, name='settings_general'),
     path('settings/security/', settings_views.settings_security, name='settings_security'),
     path('settings/features/', settings_views.settings_features, name='settings_features'),
+    path('settings/modules/', modules_views.settings_modules, name='settings_modules'),
     # PSA settings — view lives in psa.views; aliased here so it appears
     # under the same /core/settings/ tree as the rest of admin settings.
     path('settings/psa/', __import__('psa.views', fromlist=['psa_global_settings_view']).psa_global_settings_view, name='settings_psa'),
@@ -189,6 +209,8 @@ urlpatterns = [
     path('settings/updates/', views.system_updates, name='system_updates'),
     path('settings/updates/check/', views.check_updates_now, name='check_updates_now'),
     path('settings/updates/apply/', views.apply_update, name='apply_update'),
+    path('settings/updates/channel/', views.set_update_channel, name='set_update_channel'),
+    path('settings/updates/preflight/', views.upgrade_preflight_api, name='upgrade_preflight_api'),
     path('settings/updates/root-helper/', views.root_helper_install, name='root_helper_install'),
     path('settings/updates/force-restart/', views.force_restart_services, name='force_restart_services'),
     path('api/version-diagnostic/', views.version_diagnostic, name='version_diagnostic'),
@@ -204,3 +226,14 @@ urlpatterns.append(path('test-db/', test_database_connection, name='test_databas
 # Debug version endpoint
 from core.debug_version_view import debug_version
 urlpatterns.append(path('debug-version/', debug_version, name='debug_version'))
+
+# Settings → Features → Secure Notes: the notes pages 404 while it is off.
+# The link view (`secret/<token>/`) is left open: ticket secure messages are
+# SecureNotes read through it, and a recipient holding a link that was
+# already sent can still open it until it expires.
+from core.feature_gates import gate_patterns  # noqa: E402
+gate_patterns(urlpatterns, 'secure_notes_enabled', only={
+    'secure_note_inbox', 'secure_note_sent', 'secure_note_create', 'secure_note_detail',
+    'secure_note_delete', 'secure_note_link_created', 'secure_note_regenerate_link',
+    'secure_note_analytics', 'secure_note_links_dashboard',
+})

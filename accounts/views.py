@@ -670,7 +670,15 @@ def organization_create(request):
 def organization_detail(request, org_id):
     """
     View organization details and members.
-    Only accessible to members of the organization.
+
+    Open to anyone who may open this customer (core.tenancy.
+    accessible_org_ids): superusers, MSP staff — whose reach is every
+    customer, with or without a global role or technician access
+    assignments — and members of the customer or of a parent customer.
+    Until the development branch after v3.17.659 only direct members and
+    superusers got in; MSP technicians were bounced to the list, which they
+    usually can't see either. Management buttons still follow the
+    membership role (or superuser) in the template.
     """
     org = get_object_or_404(Organization, id=org_id)
 
@@ -681,7 +689,9 @@ def organization_detail(request, org_id):
         is_active=True
     ).first()
 
-    if not membership and not request.user.is_superuser:
+    from core.tenancy import accessible_org_ids
+    allowed = accessible_org_ids(request)
+    if not (allowed is None or org.pk in allowed or membership is not None):
         messages.error(request, "You don't have access to this organization.")
         return redirect('accounts:organization_list')
 
@@ -1272,6 +1282,8 @@ def user_list(request):
     })
 
 
+_TIER_ROLE_PENDING = ('The global role was not changed yet: it gives or takes an RMM tier. Confirm the request '
+                      'under Settings → Security → Technician Access; a different administrator then approves it.')
 _SUPERUSER_PENDING = ('Superuser was not granted yet. Confirm the request under Admin → Security → '
                       'Superuser Approval; a different administrator then approves it.')
 
@@ -1294,21 +1306,38 @@ def user_create(request):
             hold = superuser_policy_on() and form.cleaned_data.get('is_superuser')
             if hold:
                 form.instance.is_superuser = False
+            # A global role with an RMM tier waits for a second administrator
+            # (tech_access.services.propose_global_role); the account starts
+            # without a global role.
+            from tech_access.services import global_role_change_is_protected, propose_global_role
+            tier_role = form.cleaned_data.get('global_role_template')
+            if not global_role_change_is_protected(None, tier_role):
+                tier_role = None
+            else:
+                form.cleaned_data['global_role_template'] = None
             with transaction.atomic():
                 user = form.save()
                 # Create profile
                 UserProfile.objects.get_or_create(user=user)
-                proposal = None
+                proposal = role_change = None
                 if hold:
                     try:
                         proposal = propose_superuser_grant(user, request.user, request=request)
                     except ValueError as exc:
                         transaction.set_rollback(True)
                         form.add_error('is_superuser', str(exc))
+                if tier_role is not None and not form.errors:
+                    try:
+                        role_change = propose_global_role(user, tier_role, request.user, request=request)
+                    except ValueError as exc:
+                        transaction.set_rollback(True)
+                        form.add_error('global_role_template', str(exc))
             if not form.errors:
                 messages.success(request, f"User '{user.username}' created successfully.")
                 if proposal:
                     messages.warning(request, _SUPERUSER_PENDING)
+                if role_change:
+                    messages.warning(request, _TIER_ROLE_PENDING)
                 return redirect('accounts:user_detail', user_id=user.id)
     else:
         form = UserCreateForm()
@@ -1378,11 +1407,27 @@ def user_edit(request, user_id):
                         form.add_error('is_superuser', str(exc))
                     else:
                         form.instance.is_superuser = False
+            role_change = None
+            if not form.errors:
+                from tech_access.services import global_role_change_is_protected, propose_global_role
+                old_role = UserProfile.objects.get_or_create(user=before)[0].global_role_template
+                new_role = form.cleaned_data.get('global_role_template')
+                if global_role_change_is_protected(old_role, new_role):
+                    # Giving or taking an RMM tier waits for a second
+                    # administrator; the rest of the edit saves now.
+                    try:
+                        role_change = propose_global_role(before, new_role, request.user, request=request)
+                    except ValueError as exc:
+                        form.add_error('global_role_template', str(exc))
+                    else:
+                        form.cleaned_data['global_role_template'] = old_role
             if not form.errors:
                 user = form.save()
                 messages.success(request, f"User '{user.username}' updated successfully.")
                 if grant:
                     messages.warning(request, _SUPERUSER_PENDING)
+                if role_change:
+                    messages.warning(request, _TIER_ROLE_PENDING)
                 if proposal:
                     messages.info(request, 'The new e-mail address needs approval. Confirm it under '
                                            'Settings → Security → Technician Access; a second administrator '

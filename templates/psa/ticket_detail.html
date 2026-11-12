@@ -1,5 +1,7 @@
 {% extends "base.html" %}
 {% load vault_access %}
+{% load ticket_routing %}
+{% load ai_history %}
 {% load static %}
 {% block title %}PSA — {{ ticket.ticket_number }}{% endblock %}
 {% block extra_css %}{{ block.super }}<link href="{% static 'css/ticket_conversation.css' %}" rel="stylesheet">{% endblock %}
@@ -215,6 +217,7 @@
                  data-can-send="{{ ai_can_send|yesno:'1,0' }}"></div>
             {% endif %}
             {% include "psa/_conversation.html" with entries=conversation staff_view=is_msp_staff allow_reply=reply_open empty_text="No description or activity yet." %}
+            {% if is_msp_staff and secure_thread %}{% include "psa/_secure_thread.html" %}{% endif %}
 
             {% comment %}Reply / internal note composer — drafts autosave, posts carry the
                newest activity id so a stale reply is held for confirmation.{% endcomment %}
@@ -273,7 +276,7 @@
                     {{ canned_replies|json_script:"cannedReplies" }}
                     {% endif %}
 
-                    <textarea name="body" id="composerBody" class="form-control mb-2" rows="4" placeholder="Write a reply…" required>{{ draft.body|default:'' }}</textarea>
+                    <textarea name="body" id="composerBody" class="form-control mb-2" rows="4" placeholder="Write a reply…" aria-label="Reply" required>{{ draft.body|default:'' }}</textarea>
                     {% if is_msp_staff and ticket.requester_email %}
                     {# v3.17.654 — shown while "Email this reply" is ticked on a public reply. #}
                     <div id="composerEmailExtras" class="tc-email-extras mb-2" hidden>
@@ -373,7 +376,7 @@
             <div class="card-body">
                 <form method="post" action="{% url 'psa:ticket_attach' ticket.ticket_number %}" enctype="multipart/form-data" class="d-flex gap-2 align-items-center flex-wrap">
                     {% csrf_token %}
-                    <input type="file" name="file" class="form-control form-control-sm" required>
+                    <input type="file" name="file" class="form-control form-control-sm" aria-label="File to attach" required>
                     <div class="form-check">
                         <input class="form-check-input" type="checkbox" id="attach_is_internal" name="is_internal" value="1">
                         <label class="form-check-label small" for="attach_is_internal">internal</label>
@@ -612,7 +615,8 @@
                     <dt class="col-5">Urgency</dt><dd class="col-7">{{ ticket.get_urgency_display }}</dd>
                     <dt class="col-5">Assignee</dt><dd class="col-7">{{ ticket.assigned_to.username|default:"—" }}</dd>
                     <dt class="col-5">Contact</dt><dd class="col-7">{{ ticket.contact|default:"—" }}</dd>
-                    <dt class="col-5">Asset</dt><dd class="col-7">{% if ticket_asset %}{% if is_msp_staff %}<a href="{% url 'assets:asset_detail' ticket_asset.pk %}">{{ ticket_asset.name }}</a>{% else %}{{ ticket_asset.name }}{% endif %}{% else %}—{% endif %}</dd>
+                    <dt class="col-5">Site</dt><dd class="col-7">{% if ticket_site %}{{ ticket_site.name }}{% if is_msp_staff and ticket_site_source %} <span class="text-muted small">({{ ticket_site_source }})</span>{% endif %}{% else %}—{% endif %}</dd>
+                    <dt class="col-5">Asset</dt><dd class="col-7">{% if ticket_asset %}{% if is_msp_staff %}<a href="{% url 'assets:device_workspace' ticket_asset.pk %}?ticket={{ ticket.ticket_number|urlencode }}" data-ticket-asset-workspace>{{ ticket_asset.name }}</a>{% else %}{{ ticket_asset.name }}{% endif %}{% else %}—{% endif %}</dd>
                     <dt class="col-5">Doc</dt><dd class="col-7">{{ ticket.related_documentation|default:"—" }}</dd>
                     <dt class="col-5">KB</dt><dd class="col-7">{{ ticket.related_kb_article|default:"—" }}</dd>
                     <dt class="col-5">Calendar</dt><dd class="col-7">{{ ticket.related_calendar_event|default:"—" }}</dd>
@@ -651,6 +655,39 @@
         </div>
         {% endif %}
 
+        {% if is_msp_staff %}
+        {# Phase 60.6 — the customer's site this ticket is about. #}
+        <div class="card mt-3" id="ticket-site-card">
+            <div class="card-header"><strong><i class="fas fa-map-marker-alt me-1"></i>Site</strong></div>
+            <div class="card-body small">
+                {% if ticket_site %}
+                <p class="mb-2">{{ ticket_site.name }}{% if ticket_site.city %} · {{ ticket_site.city }}{% endif %}{% if ticket_site_source %} <span class="text-muted">({{ ticket_site_source }})</span>{% endif %}</p>
+                {% endif %}
+                {% if ticket_site_choices %}
+                <form method="post" action="{% url 'psa:ticket_quick_action' ticket.ticket_number %}">
+                    {% csrf_token %}
+                    <input type="hidden" name="action" value="set_site">
+                    <div class="d-flex gap-2">
+                        <select name="site" class="form-select form-select-sm" aria-label="Site for this ticket">
+                            <option value="">— No site —</option>
+                            {% for loc in ticket_site_choices %}
+                            <option value="{{ loc.pk }}" {% if ticket_site and ticket_site.pk == loc.pk %}selected{% endif %}>{{ loc.name }}{% if loc.city %} ({{ loc.city }}){% endif %}</option>
+                            {% endfor %}
+                        </select>
+                        <button class="btn btn-sm btn-outline-primary">Set</button>
+                    </div>
+                    <div class="form-check mt-1">
+                        <input class="form-check-input" type="checkbox" name="remember" id="site-remember">
+                        <label class="form-check-label" for="site-remember">Remember as the requester's default site</label>
+                    </div>
+                </form>
+                {% else %}
+                <p class="text-muted mb-0">This customer has no active sites.</p>
+                {% endif %}
+            </div>
+        </div>
+        {% endif %}
+
         {% comment %}
             Phase 46 (v3.17.533) — what the tech has to take. Attached to the
             ticket rather than the scheduled visit so it survives rescheduling
@@ -676,8 +713,9 @@
                             <form method="post" action="{% url 'psa:ticket_kit_toggle_packed' ticket.ticket_number item.pk %}">
                                 {% csrf_token %}
                                 <button class="btn btn-sm p-0 border-0 bg-transparent"
-                                        title="{% if item.packed %}Mark not packed{% else %}Mark packed{% endif %}">
-                                    <i class="{% if item.packed %}fas fa-square-check text-success{% else %}far fa-square text-muted{% endif %}"></i>
+                                        title="{% if item.packed %}Mark not packed{% else %}Mark packed{% endif %}"
+                                        aria-label="{% if item.packed %}Mark {{ item }} not packed{% else %}Mark {{ item }} packed{% endif %}">
+                                    <i aria-hidden="true" class="{% if item.packed %}fas fa-square-check text-success{% else %}far fa-square text-muted{% endif %}"></i>
                                 </button>
                             </form>
                             <div>
@@ -819,15 +857,15 @@
                         <input type="checkbox" id="timer_billable" name="is_billable" value="1" class="form-check-input" checked>
                         <label class="form-check-label small" for="timer_billable">Billable</label>
                     </div>
-                    <input type="text" name="role_code" class="form-control form-control-sm" placeholder="Role (e.g. T1)" maxlength="40" style="width:110px;" title="Optional role / tier code, matched against the contract's billable and excluded role codes">
+                    <input type="text" name="role_code" class="form-control form-control-sm" placeholder="Role (e.g. T1)" aria-label="Timer role code (optional)" maxlength="40" style="width:110px;" title="Optional role / tier code, matched against the contract's billable and excluded role codes">
                     <button type="submit" class="btn btn-sm btn-outline-primary ms-auto"><i class="fas fa-play me-1"></i>Start timer</button>
                 </form>
                 {% endif %}
                 <form method="post" action="{% url 'psa:time_entry_manual' ticket.ticket_number %}" class="d-flex gap-1 align-items-center">
                     {% csrf_token %}
-                    <input type="number" name="minutes" id="timeManualMinutes" class="form-control form-control-sm" placeholder="min" min="1" max="1440" style="width:80px;" required>
-                    <input type="text" name="notes" class="form-control form-control-sm" placeholder="Notes (manual entry)" maxlength="200">
-                    <input type="text" name="role_code" class="form-control form-control-sm" placeholder="Role" maxlength="40" style="width:80px;" title="Optional role / tier code, matched against the contract's billable and excluded role codes">
+                    <input type="number" name="minutes" id="timeManualMinutes" class="form-control form-control-sm" placeholder="min" aria-label="Minutes worked" min="1" max="1440" style="width:80px;" required>
+                    <input type="text" name="notes" class="form-control form-control-sm" placeholder="Notes (manual entry)" aria-label="Time entry notes" maxlength="200">
+                    <input type="text" name="role_code" class="form-control form-control-sm" placeholder="Role" aria-label="Time entry role code (optional)" maxlength="40" style="width:80px;" title="Optional role / tier code, matched against the contract's billable and excluded role codes">
                     <div class="form-check">
                         <input type="checkbox" id="manual_billable" name="is_billable" value="1" class="form-check-input" checked>
                         <label class="form-check-label small" for="manual_billable">Bill</label>
@@ -866,6 +904,12 @@
                 </form>
             </div>
         </div>
+
+        {# Ticket routing history + suggestions (staff only, never in the portal) #}
+        {% if is_msp_staff %}{% routing_ticket_panel ticket %}{% endif %}
+
+        {# AI and automation history (staff only, never in the portal) #}
+        {% if is_msp_staff %}{% ai_history_panel ticket %}{% endif %}
 
         {# Workflows applied to this ticket — full inline stage checklist #}
         <style>
@@ -909,6 +953,12 @@
                             <a href="{% url 'processes:execution_audit_log' ex.pk %}" class="text-decoration-none">
                                 <i class="fas fa-history me-1"></i>View audit log
                             </a>
+                            {% if ex.is_offboarding %}
+                            <span class="text-muted mx-1">·</span>
+                            <a href="{% url 'processes:execution_access_verification' ex.pk %}" class="text-decoration-none">
+                                <i class="fas fa-user-lock me-1"></i>Verify access removal
+                            </a>
+                            {% endif %}
                             {% if request.user.is_superuser %}
                             <span class="text-muted mx-1">·</span>
                             <a href="{% url 'processes:execution_detail' ex.pk %}" class="text-decoration-none text-muted">
@@ -1057,23 +1107,23 @@
                       enctype="multipart/form-data" class="row g-2 small mb-2">
                     {% csrf_token %}
                     <div class="col-12">
-                        <input type="text" name="description" class="form-control form-control-sm" required placeholder="What was bought / consumed">
+                        <input type="text" name="description" class="form-control form-control-sm" required placeholder="What was bought / consumed" aria-label="Expense description">
                     </div>
                     <div class="col-4">
-                        <input type="number" step="0.01" name="amount" class="form-control form-control-sm" required placeholder="Amount">
+                        <input type="number" step="0.01" name="amount" class="form-control form-control-sm" required placeholder="Amount" aria-label="Expense amount">
                     </div>
                     <div class="col-3">
-                        <input type="text" name="currency" class="form-control form-control-sm" value="USD" maxlength="8">
+                        <input type="text" name="currency" class="form-control form-control-sm" value="USD" maxlength="8" aria-label="Currency">
                     </div>
                     <div class="col-5">
-                        <select name="category" class="form-select form-select-sm">
+                        <select name="category" class="form-select form-select-sm" aria-label="Expense category">
                             {% for code, label in expense_categories %}
                             <option value="{{ code }}">{{ label }}</option>
                             {% endfor %}
                         </select>
                     </div>
                     <div class="col-6">
-                        <input type="date" name="incurred_on" class="form-control form-control-sm">
+                        <input type="date" name="incurred_on" class="form-control form-control-sm" aria-label="Date incurred">
                     </div>
                     <div class="col-3 form-check ms-2">
                         <input type="checkbox" id="expense_billable" name="is_billable" class="form-check-input" checked>
@@ -1084,7 +1134,7 @@
                         <label class="form-check-label small" for="expense_reimbursable">Reimbursable</label>
                     </div>
                     <div class="col-12">
-                        <input type="file" name="receipt_file" class="form-control form-control-sm" accept="image/*,application/pdf">
+                        <input type="file" name="receipt_file" class="form-control form-control-sm" accept="image/*,application/pdf" aria-label="Receipt (image or PDF)">
                     </div>
                     <div class="col-12">
                         <button type="submit" class="btn btn-sm btn-outline-secondary">Add expense</button>

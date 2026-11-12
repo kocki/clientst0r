@@ -13,9 +13,17 @@ import logging
 logger = logging.getLogger('imports')
 
 
-def is_staff_or_superuser(user):
-    """Check if user is staff or superuser."""
-    return user.is_superuser or (hasattr(user, 'is_staff_user') and user.is_staff_user)
+def is_import_admin(user):
+    """Who may use the legacy import screens: Django superusers only.
+
+    This used to be called `is_staff_or_superuser` and also tested
+    `user.is_staff_user`, an attribute no User has (MSP staff status lives
+    on `user.profile.is_staff_user()` and on the request), so that half was
+    always False and the screens have only ever been open to superusers.
+    That is kept as the rule on purpose: imports create customers and write
+    into every customer, and opening them to MSP staff is the owner's call.
+    """
+    return bool(user.is_authenticated and user.is_superuser)
 
 
 def report_import_outcome(request, job):
@@ -60,7 +68,7 @@ def report_rollback_outcome(request, stats):
 
 
 @login_required
-@user_passes_test(is_staff_or_superuser)
+@user_passes_test(is_import_admin)
 def import_list(request):
     """List all import jobs."""
     jobs = ImportJob.objects.all().select_related('target_organization', 'started_by').order_by('-created_at')
@@ -71,7 +79,7 @@ def import_list(request):
 
 
 @login_required
-@user_passes_test(is_staff_or_superuser)
+@user_passes_test(is_import_admin)
 def import_create(request):
     """Create new import job."""
     if request.method == 'POST':
@@ -97,7 +105,7 @@ def import_create(request):
 
 
 @login_required
-@user_passes_test(is_staff_or_superuser)
+@user_passes_test(is_import_admin)
 def import_detail(request, pk):
     """View import job details."""
     job = get_object_or_404(ImportJob.objects.select_related('target_organization', 'started_by'), pk=pk)
@@ -108,10 +116,13 @@ def import_detail(request, pk):
 
 
 @login_required
-@user_passes_test(is_staff_or_superuser)
+@user_passes_test(is_import_admin)
 def import_edit(request, pk):
     """Edit import job (only if not started)."""
     job = get_object_or_404(ImportJob, pk=pk)
+
+    if job.rehearsal_plan is not None:
+        return redirect('imports:rehearsal_detail', pk=job.rehearsal_plan.pk)
 
     if job.status != 'pending':
         messages.error(request, 'Cannot edit import job that has already started.')
@@ -134,7 +145,7 @@ def import_edit(request, pk):
 
 
 @login_required
-@user_passes_test(is_staff_or_superuser)
+@user_passes_test(is_import_admin)
 def import_delete(request, pk):
     """Delete import job."""
     job = get_object_or_404(ImportJob, pk=pk)
@@ -150,7 +161,7 @@ def import_delete(request, pk):
 
 
 @login_required
-@user_passes_test(is_staff_or_superuser)
+@user_passes_test(is_import_admin)
 def import_rollback(request, pk):
     """
     Rollback import job - delete all imported objects.
@@ -184,6 +195,14 @@ def import_rollback(request, pk):
             # Perform rollback (atomic; partial outcomes are reported)
             stats = job.rollback(request.user)
             report_rollback_outcome(request, stats)
+            from audit.models import AuditLog
+            from core.client_ip import get_client_ip
+            AuditLog.log(user=request.user, action='delete', organization=job.target_organization,
+                         object_type='import_job', object_id=job.pk, object_repr=str(job)[:255],
+                         description=('Rolled back import job' if stats.get('complete')
+                                      else 'Partially rolled back import job'),
+                         ip_address=get_client_ip(request), path=request.path,
+                         extra_data={'total_deleted': stats.get('total_deleted', 0)})
             return redirect('imports:import_detail', pk=job.pk)
 
         except Exception as e:
@@ -201,10 +220,14 @@ def import_rollback(request, pk):
 
 
 @login_required
-@user_passes_test(is_staff_or_superuser)
+@user_passes_test(is_import_admin)
 def import_start(request, pk):
     """Start an import job."""
     job = get_object_or_404(ImportJob, pk=pk)
+
+    if job.rehearsal_plan is not None:
+        # Rehearsal jobs are applied from their reviewed plan only.
+        return redirect('imports:rehearsal_detail', pk=job.rehearsal_plan.pk)
 
     if job.status not in ['pending', 'failed']:
         messages.error(request, f'Cannot start import job with status: {job.get_status_display()}')
@@ -230,7 +253,7 @@ def import_start(request, pk):
 
 
 @login_required
-@user_passes_test(is_staff_or_superuser)
+@user_passes_test(is_import_admin)
 def import_promote(request, pk):
     """Promote a completed dry-run job to an actual import.
 
@@ -238,6 +261,9 @@ def import_promote(request, pk):
     then redirects to the start page so the user can confirm and run it.
     """
     job = get_object_or_404(ImportJob, pk=pk)
+
+    if job.rehearsal_plan is not None:
+        return redirect('imports:rehearsal_detail', pk=job.rehearsal_plan.pk)
 
     if not (job.status in ImportJob.SUCCESS_STATUSES and job.dry_run):
         messages.error(request, 'Only completed dry-run jobs can be promoted to an actual import.')
@@ -262,7 +288,7 @@ def import_promote(request, pk):
 
 
 @login_required
-@user_passes_test(is_staff_or_superuser)
+@user_passes_test(is_import_admin)
 def import_log(request, pk):
     """View import job log."""
     job = get_object_or_404(ImportJob, pk=pk)
@@ -273,7 +299,7 @@ def import_log(request, pk):
 
 
 @login_required
-@user_passes_test(is_staff_or_superuser)
+@user_passes_test(is_import_admin)
 def import_map_fields(request, pk):
     """
     CSV field mapper: let user map source columns to target model fields.

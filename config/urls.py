@@ -70,6 +70,10 @@ urlpatterns = [
     path('scheduling/', include('scheduling.urls')),
     # Ticket → paired RMM (ticket-rmm-v1 56.5/56.6). Not AI; works with AI off.
     path('psa/rmm/', include('psa_ai.rmm_views')),
+    # Optional ticket routing (off by default). Not AI.
+    path('psa/routing/', include('psa.routing.urls')),
+    # One-click support workflows for alert tickets. Not AI; works with AI off.
+    path('psa/workflows/', include('psa.support_workflows.urls')),
     path('psa/', include('psa.urls')),
     path('psa/ai/', include('psa_ai.urls')),
     path('portal/', include('portal.urls')),
@@ -90,6 +94,7 @@ urlpatterns = [
     path('network-discovery/', include('network_discovery.urls')),
 
     path('settings/security/technician-access/', include('tech_access.urls')),
+    path('settings/security/rmm-permissions/', include('rmm_permissions.urls')),
     # Ticket ↔ paired RMM integration (ticket-rmm-v1): signed requests only.
     path('api/integration/v1/', include('psa_ai.integration_api')),
 

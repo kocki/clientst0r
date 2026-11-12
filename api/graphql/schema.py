@@ -93,7 +93,7 @@ class DocumentType(DjangoObjectType):
         fields = (
             'id', 'title', 'slug', 'body', 'content_type', 'is_published',
             'is_draft', 'is_template', 'is_archived', 'is_global', 'organization',
-            'created_at', 'updated_at',
+            'is_client_visible', 'created_at', 'updated_at',
         )
 
 
@@ -270,6 +270,17 @@ def _visible_diagrams(info, organization_id=None):
     return _live_or_editable(qs, info, Q(is_published=True))
 
 
+def _visible_monitors(info, organization_id=None):
+    # Monitors and expirations live under /monitoring/ in the web app.
+    return _scoped(WebsiteMonitor.objects.all(), info, organization_id,
+                   perm='monitoring_view')
+
+
+def _visible_expirations(info, organization_id=None):
+    return _scoped(Expiration.objects.all(), info, organization_id,
+                   perm='monitoring_view')
+
+
 def _get_or_none(queryset, pk):
     return queryset.filter(pk=pk).first()
 
@@ -402,22 +413,22 @@ class Query(graphene.ObjectType):
 
     @login_required
     def resolve_website_monitor(self, info, id):
-        return _get_or_none(_scoped(WebsiteMonitor.objects.all(), info), id)
+        return _get_or_none(_visible_monitors(info), id)
 
     @login_required
     def resolve_website_monitors(self, info, organization_id=None):
-        return _scoped(WebsiteMonitor.objects.all(), info, organization_id)
+        return _visible_monitors(info, organization_id)
 
     @login_required
     def resolve_expirations(self, info, organization_id=None):
-        return _scoped(Expiration.objects.all(), info, organization_id)
+        return _visible_expirations(info, organization_id)
 
     @login_required
     def resolve_expiring_soon(self, info, days=30):
         from datetime import timedelta
         from django.utils import timezone
         now = timezone.now()
-        return _scoped(Expiration.objects.all(), info).filter(
+        return _visible_expirations(info).filter(
             expires_at__lte=now + timedelta(days=days),
             expires_at__gte=now,
         ).order_by('expires_at')
@@ -431,9 +442,7 @@ class Query(graphene.ObjectType):
             total_passwords=_visible_passwords(info).count(),
             total_documents=_visible_documents(info).filter(is_global=False).count(),
             total_diagrams=_visible_diagrams(info).filter(is_global=False).count(),
-            active_monitors=WebsiteMonitor.objects.filter(
-                organization_id__in=org_ids, is_enabled=True,
-            ).count(),
+            active_monitors=_visible_monitors(info).filter(is_enabled=True).count(),
         )
 
 

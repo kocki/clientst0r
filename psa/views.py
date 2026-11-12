@@ -40,6 +40,7 @@ from .models import (
     Queue,
     Quote,
     QuoteLineItem,
+    QuoteSignature,
     RecurringTicketSchedule,
     ServiceCatalogItem,
     Ticket,
@@ -217,6 +218,16 @@ def ticket_list(request):
     })
 
 
+def _record_ai_draft_decision(ticket, request, body, **kw):
+    """Ticket AI and automation history: what the technician did with an AI
+    draft (psa_ai/services/history.py). Recording never blocks the reply."""
+    try:
+        from psa_ai.services.history import record_draft_decision
+        record_draft_decision(ticket, request.user, body, (request.POST.get('ai_draft') or '').strip(), **kw)
+    except Exception:
+        logger.exception('recording the AI draft decision on %s failed', ticket.ticket_number)
+
+
 @login_required
 @require_psa_enabled
 def ticket_detail(request, ticket_number):
@@ -383,7 +394,8 @@ def ticket_detail(request, ticket_number):
 
     context = {
         **workspace,
-        **_ticket_asset_context(ticket, workspace['is_msp_staff']),
+        **_ticket_asset_context(ticket, workspace['is_msp_staff'], request.user),
+        **_ticket_site_context(ticket, workspace['is_msp_staff']),
         'ticket_rmm_panel': _ticket_rmm_panel(request, ticket, workspace['is_msp_staff']),
         'ticket': ticket,
         'workflow_executions': workflow_executions,
@@ -432,6 +444,9 @@ def ticket_detail(request, ticket_number):
         'kit_inventory': InventoryItem.objects.for_organization(
             ticket.organization),
     }
+    if workspace['is_msp_staff']:
+        from .ticket_secure import thread_for_ticket
+        context['secure_thread'] = thread_for_ticket(ticket)
     if not workspace['is_msp_staff']:
         # A customer user reaching the staff ticket page gets the portal's
         # view of the ticket: the shared conversation and their own
@@ -449,7 +464,7 @@ STAFF_ONLY_TICKET_CONTEXT = {
     'total_minutes': 0, 'billable_minutes': 0, 'similar_tickets': [], 'contract': None,
     'expenses': [], 'total_expense_billable': 0, 'problems': [], 'problem_can_create': False,
     'kit_items': [], 'kit_packed_count': 0, 'kit_tools': [], 'kit_inventory': [],
-    'can_assign': False, 'eligible_assignees': [], 'hygiene': [],
+    'can_assign': False, 'eligible_assignees': [], 'hygiene': [], 'secure_thread': [],
 }
 
 
@@ -689,6 +704,26 @@ def ticket_create(request):
             if (linked is not None and linked.organization_id == alert.device.organization_id
                     and alert.device.link_status in (RMMDevice.LINK_AUTO, RMMDevice.LINK_CONFIRMED)):
                 preselected_asset_id = linked.pk
+    # From customer operations ("Plan replacement", "Open ticket"):
+    # ?asset=<id> preselects that asset and its customer, only when the
+    # customer is one this user may file for and their role there includes
+    # assets_view; ?subject= prefills the subject. Nothing is saved.
+    from core.prefill import text_param
+    asset_param = (request.GET.get('asset') or '').strip()
+    if not alert_id and asset_param.isdigit() and len(asset_param) <= 12:
+        from accounts.permission_utils import has_perm_for_org
+        from assets.models import Asset as _Asset
+        asset = (_Asset.objects.filter(pk=int(asset_param), organization__in=eligible_clients)
+                 .select_related('organization').first())
+        if asset is not None and has_perm_for_org(request.user, asset.organization, 'assets_view'):
+            preselected_id = asset.organization_id
+            preselected_asset_id = asset.pk
+    client_param = (request.GET.get('client') or '').strip()
+    if (not alert_id and preselected_asset_id is None and client_param.isdigit()
+            and len(client_param) <= 12 and eligible_clients.filter(id=int(client_param)).exists()):
+        preselected_id = int(client_param)
+    if not prefill_subject:
+        prefill_subject = text_param(request, 'subject', max_length=300)
     from assets.models import Asset
     client_assets = (list(Asset.objects.filter(organization_id=preselected_id).order_by('name')
                           .only('id', 'name', 'hostname')[:500]) if preselected_id else [])
@@ -809,10 +844,13 @@ def psa_global_settings_view(request):
             if cps is not None:
                 cps_pk = cps.pk
                 org_repr = str(cps.organization)
-                cps.delete()
+                # enabled=True is the auto-detect default. The row is kept,
+                # not deleted: it also holds the customer's portal switch.
+                cps.enabled = True
+                cps.save(update_fields=['enabled', 'updated_at'])
                 AuditLog.log(
-                    user=request.user, action='delete',
-                    organization_id=int(org_id),
+                    user=request.user, action='update',
+                    organization=cps.organization,
                     object_type='psa.ClientPSASettings', object_id=cps_pk,
                     object_repr=f'PSA opt-out removed for {org_repr}',
                     description='Removed PSA opt-out — client returns to auto-detect',
@@ -821,26 +859,14 @@ def psa_global_settings_view(request):
                 messages.success(request, f'Removed opt-out for {org_repr}.')
             return redirect('psa:settings')
 
-        # Default: save global per-surface flags + AI behavior knobs
+        # Default: save the close-out rule + AI behavior knobs
         previous = {
-            'psa_portal_enabled': settings.psa_portal_enabled,
-            'psa_anonymous_ticket_form_enabled': settings.psa_anonymous_ticket_form_enabled,
-            'psa_email_to_ticket_enabled': settings.psa_email_to_ticket_enabled,
-            'psa_sms_notifications_enabled': settings.psa_sms_notifications_enabled,
-            'psa_desktop_alerts_enabled': settings.psa_desktop_alerts_enabled,
-            'psa_external_alert_ingest_enabled': settings.psa_external_alert_ingest_enabled,
             'psa_closeout_require_time': settings.psa_closeout_require_time,
             'psa_ai_enabled': settings.psa_ai_enabled,
             'psa_ai_voice': settings.psa_ai_voice,
             'psa_ai_min_confidence': str(settings.psa_ai_min_confidence),
             'psa_ai_blocked_subject_keywords': settings.psa_ai_blocked_subject_keywords,
         }
-        settings.psa_portal_enabled = request.POST.get('psa_portal_enabled') == 'on'
-        settings.psa_anonymous_ticket_form_enabled = request.POST.get('psa_anonymous_ticket_form_enabled') == 'on'
-        settings.psa_email_to_ticket_enabled = request.POST.get('psa_email_to_ticket_enabled') == 'on'
-        settings.psa_sms_notifications_enabled = request.POST.get('psa_sms_notifications_enabled') == 'on'
-        settings.psa_desktop_alerts_enabled = request.POST.get('psa_desktop_alerts_enabled') == 'on'
-        settings.psa_external_alert_ingest_enabled = request.POST.get('psa_external_alert_ingest_enabled') == 'on'
         settings.psa_closeout_require_time = request.POST.get('psa_closeout_require_time') == 'on'
 
         settings.psa_ai_enabled = request.POST.get('psa_ai_enabled') == 'on'
@@ -889,12 +915,61 @@ def psa_global_settings_view(request):
     })
 
 
-# Backwards-compat shim: the old per-client URL still resolves but
-# redirects to the new global page so any bookmarks keep working.
 @login_required
 @require_psa_enabled
 def client_settings_view(request):
-    return redirect('psa:settings')
+    """Per-customer PSA settings for the selected customer: the native PSA
+    opt-out and the customer portal switch.
+
+    Those are the only two per-customer switches anything reads
+    (`is_psa_enabled_for_client` and the portal's membership query). The
+    five other per-customer switches this page used to show (anonymous
+    form, email-to-ticket, SMS, desktop alerts, external ingest) were never
+    read and were removed in psa 0083, as the global ones were in core 0087.
+    Superuser-only, like the global PSA settings page. Audited.
+    """
+    if not request.user.is_superuser:
+        raise Http404()
+    from psa.feature_flags import client_has_external_psa, get_external_psa_summary
+    org = get_request_organization(request)
+    if org is None:
+        messages.info(request, 'Select a customer to change its PSA settings.')
+        return redirect('psa:settings')
+    has_external = client_has_external_psa(org)
+    cps = ClientPSASettings.objects.filter(organization=org).first()
+
+    if request.method == 'POST':
+        row = cps or ClientPSASettings(organization=org)
+        before = {'enabled': row.enabled, 'portal_enabled': row.portal_enabled} if cps else {}
+        if request.POST.get('reset_to_auto'):
+            row.enabled = True  # a row with enabled=True is the auto-detect default
+        else:
+            row.enabled = (request.POST.get('enabled') == 'on') if not has_external else row.enabled
+            row.portal_enabled = request.POST.get('portal_enabled') == 'on'
+        row.save()
+        after = {'enabled': row.enabled, 'portal_enabled': row.portal_enabled}
+        changed = {k: {'from': before.get(k), 'to': v} for k, v in after.items() if before.get(k) != v}
+        if changed:
+            AuditLog.log(
+                user=request.user, action='update' if cps else 'create', organization=org,
+                object_type='psa.ClientPSASettings', object_id=row.pk,
+                object_repr=f'PSA settings for {org.name}'[:255],
+                description=f'Updated PSA settings for {org.name}: ' + ', '.join(
+                    f'{k} {v["from"]} -> {v["to"]}' for k, v in changed.items()),
+                ip_address=_client_ip(request), path=request.path,
+                extra_data={'changed_fields': changed},
+            )
+        messages.success(request, f'PSA settings for {org.name} saved.')
+        return redirect('psa:client_settings')
+
+    return render(request, 'psa/client_settings.html', {
+        'cps': cps or ClientPSASettings(organization=org),
+        'current_organization': org,
+        'effective_enabled': is_psa_enabled_for_client(org),
+        'using_auto_detect': cps is None or cps.enabled,
+        'has_external_psa': has_external,
+        'external_psa_summary': get_external_psa_summary(org) if has_external else '',
+    })
 
 
 @login_required
@@ -946,7 +1021,7 @@ def ticket_vault_context(request, ticket_number):
     })
 
 
-def _ticket_asset_context(ticket, staff):
+def _ticket_asset_context(ticket, staff, user=None):
     """The ticket's asset and, for technicians, what its RMMs report.
 
     Built from synced data only, so an RMM outage never slows or breaks the
@@ -960,12 +1035,29 @@ def _ticket_asset_context(ticket, staff):
            'ticket_rmm': [], 'ticket_asset_choices': []}
     if not staff:
         return ctx
-    if asset and not foreign:
+    # RMM details follow integrations_view (or RMM device access) for the
+    # ticket's customer, like the same devices under /integrations/.
+    from integrations.rmm_visibility import can_see_rmm_data
+    if asset and not foreign and (user is None or can_see_rmm_data(user, ticket.organization)):
         from integrations.rmm_association import summaries_for_asset
         ctx['ticket_rmm'] = summaries_for_asset(asset)
     ctx['ticket_asset_choices'] = list(
         Asset.objects.filter(organization_id=ticket.organization_id).order_by('name')
         .only('id', 'name', 'hostname')[:500])
+    return ctx
+
+
+def _ticket_site_context(ticket, staff):
+    """Phase 60.6: the ticket's site and, for technicians, the sites they can
+    pick from. A site that no longer belongs to the customer is hidden."""
+    from psa.ticket_site import SOURCE_CHOICES, site_allowed, sites_for
+    site = ticket.site if ticket.site_id else None
+    if site is not None and not site_allowed(ticket.organization, site):
+        site = None
+    ctx = {'ticket_site': site, 'ticket_site_source': dict(SOURCE_CHOICES).get(ticket.site_source or '', ''),
+           'ticket_site_choices': []}
+    if staff:
+        ctx['ticket_site_choices'] = list(sites_for(ticket.organization)[:500])
     return ctx
 
 
@@ -1089,6 +1181,7 @@ def ticket_post_comment(request, ticket_number):
             if not has_capability(request.user, ticket.organization, 'send_reply', ticket=ticket):
                 TicketDraft.objects.update_or_create(
                     user=request.user, ticket=ticket, defaults={'body': body, 'is_internal': False})
+                _record_ai_draft_decision(ticket, request, body, refused=True)
                 messages.error(
                     request,
                     "This reply came from an AI draft, and your technician access doesn't include sending "
@@ -1140,6 +1233,9 @@ def ticket_post_comment(request, ticket_number):
         parent_comment=parent, cc_emails=cc_emails if send_email else [],
         secure_note=secure_note,
     )
+
+    if is_msp_staff(request.user) and (ai_assisted or is_internal):
+        _record_ai_draft_decision(ticket, request, body, comment=comment, internal=is_internal)
 
     now = timezone.now()
     update_fields = ['updated_by', 'updated_at', 'last_tech_response_at']
@@ -1749,6 +1845,40 @@ def _ticket_quick_action(request, ticket_number):
         )
         description = f'Asset of {ticket.ticket_number}: {prev.name if prev else "none"} → {asset.name if asset else "none"}'
         audit_extra['previous_asset_id'] = prev.pk if prev else None
+
+    elif action == 'set_site':
+        # Phase 60.6. Changes the site only — never the customer, access,
+        # assignment or SLA. Routing does not re-run because of it.
+        if not is_msp_staff(request.user):
+            from django.core.exceptions import ValidationError as _VE
+            raise _VE('Only MSP technicians can change the ticket site.')
+        from locations.models import Location
+        from psa.ticket_site import SOURCE_MANUAL, remember_default, site_allowed
+        raw = (request.POST.get('site') or '').strip()
+        site = None
+        if raw:
+            site = Location.objects.filter(pk=int(raw) if raw.isdigit() else 0).first()
+            if site is None or not site_allowed(ticket.organization, site):
+                messages.error(request, "That site doesn't belong to this ticket's customer.")
+                return redirect(reverse('psa:ticket_detail', kwargs={'ticket_number': ticket.ticket_number}))
+        prev = ticket.site if ticket.site_id else None
+        ticket.site = site
+        ticket.site_source = SOURCE_MANUAL if site else ''
+        ticket.updated_by = request.user
+        ticket.save(update_fields=['site', 'site_source', 'updated_by', 'updated_at'])
+        remembered = ''
+        if site is not None and request.POST.get('remember') == 'on':
+            remembered = remember_default(ticket, site, actor=request.user)
+        TicketComment.objects.create(
+            ticket=ticket, author=request.user,
+            body=(f'Site: {prev.name if prev else "none"} → {site.name if site else "none"}.'
+                  + (f' Remembered as the {remembered}.' if remembered else '')),
+            is_internal=True, is_system=True,
+        )
+        description = f'Site of {ticket.ticket_number}: {prev.name if prev else "none"} → {site.name if site else "none"}'
+        audit_extra['previous_site_id'] = prev.pk if prev else None
+        if remembered:
+            audit_extra['remembered'] = remembered
 
     elif action == 'set_status':
         try:
@@ -3174,12 +3304,20 @@ def contract_form(request, pk=None):
     client_orgs = _customer_orgs(request).filter(is_active=True).order_by('name')
 
     def _render(selected_org_id=None):
+        # SLA overrides are rendered into the inputs server-side: filling them
+        # from a script meant a save with that script not run cleared them.
+        matrix = (item.sla_matrix if item else None) or {}
+        priorities = list(TicketPriority.objects.all().order_by('sort_order'))
+        for p in priorities:
+            entry = matrix.get(p.code) if isinstance(matrix.get(p.code), dict) else {}
+            p.override_response = entry.get('response_minutes')
+            p.override_resolution = entry.get('resolution_minutes')
         return render(request, 'psa/contract_form.html', {
             'item': item,
             'client_orgs': client_orgs,
             'contract_types': Contract.CONTRACT_TYPES,
             'status_choices': Contract.STATUS_CHOICES,
-            'priorities': TicketPriority.objects.all().order_by('sort_order'),
+            'priorities': priorities,
             'selected_client_org_id': selected_org_id if selected_org_id is not None
                                        else (item.organization_id if item else (org.pk if org else None)),
         })
@@ -3199,14 +3337,16 @@ def contract_form(request, pk=None):
             messages.error(request, 'Please choose a client for this contract.')
             return _render()
 
-        name = (request.POST.get('name') or '').strip()
-        client_org_id = request.POST.get('client_org')
+        # On an edit, a POST that does not carry the name or client keeps
+        # the saved ones; posting either blank is still refused.
+        name = (request.POST.get('name', item.name if item else '') or '').strip()
+        client_org_id = request.POST.get('client_org', str(item.client_org_id) if item else '')
         if not name or not client_org_id:
             messages.error(request, 'Name and client are required.')
             return _render(selected_org_id=item_org.pk)
         try:
             client_org = _customer_orgs(request).get(pk=client_org_id)
-        except Organization.DoesNotExist:
+        except (Organization.DoesNotExist, ValueError, TypeError):
             messages.error(request, 'Client not found.')
             return _render(selected_org_id=item_org.pk)
 
@@ -3217,74 +3357,53 @@ def contract_form(request, pk=None):
             item.organization = item_org
             item.client_org = client_org
             item.name = name
-        item.contract_type = request.POST.get('contract_type') or 'block_hours'
-        item.status = request.POST.get('status') or 'draft'
-        item.start_date = request.POST.get('start_date') or item.start_date
-        item.end_date = request.POST.get('end_date') or None
-        try:
-            item.total_hours = request.POST.get('total_hours') or 0
-        except (TypeError, ValueError):
-            item.total_hours = 0
-        try:
-            item.hourly_rate = request.POST.get('hourly_rate') or 0
-            item.overage_rate = request.POST.get('overage_rate') or 0
-        except (TypeError, ValueError):
-            pass
-        item.notes = (request.POST.get('notes') or '').strip()
+        # A field the POST does not carry keeps the saved value; only a
+        # field posted blank is a clear (see psa/form_fields.py).
+        from decimal import Decimal
+        from .form_fields import PostedFields
+        f = PostedFields(request.POST)
+        item.contract_type = f.choice('contract_type', item.contract_type or 'block_hours',
+                                      dict(Contract.CONTRACT_TYPES))
+        item.status = f.choice('status', item.status or 'draft', dict(Contract.STATUS_CHOICES))
+        item.start_date = f.date('start_date', item.start_date, blank=item.start_date)
+        item.end_date = f.date('end_date', item.end_date, blank=None)
+        item.total_hours = f.decimal('total_hours', item.total_hours, minimum=Decimal('0'))
+        item.hourly_rate = f.decimal('hourly_rate', item.hourly_rate, minimum=Decimal('0'))
+        item.overage_rate = f.decimal('overage_rate', item.overage_rate, minimum=Decimal('0'))
+        item.notes = f.text('notes', item.notes or '')
 
         # Phase 1 contract-engine fields (rollover, auto-renew, role gates).
         # rolled_over_minutes / rollover_expires_at / parent_contract are
         # intentionally NOT exposed here — they're set by the renewal cron.
-        from decimal import Decimal, InvalidOperation
-
-        def _decimal(name, default='0'):
-            try:
-                return Decimal(request.POST.get(name) or default)
-            except (InvalidOperation, TypeError):
-                return Decimal(default)
-
-        def _int(name, default=0):
-            try:
-                return int(request.POST.get(name) or default)
-            except (TypeError, ValueError):
-                return default
-
-        def _bool(name):
-            return (request.POST.get(name) or '').lower() in ('1', 'true', 'on', 'yes')
-
-        def _csv_list(name):
-            raw = (request.POST.get(name) or '').strip()
-            if not raw:
-                return []
-            return [s.strip() for s in raw.split(',') if s.strip()]
-
-        item.rollover_percent = _decimal('rollover_percent')
-        item.rollover_expiry_days = _int('rollover_expiry_days')
-        item.auto_renew = _bool('auto_renew')
-        item.auto_renew_period_months = _int('auto_renew_period_months', 12) or 12
-        item.proration_enabled = _bool('proration_enabled')
-        item.billable_role_codes = _csv_list('billable_role_codes')
-        item.excluded_role_codes = _csv_list('excluded_role_codes')
+        item.rollover_percent = f.decimal('rollover_percent', item.rollover_percent, minimum=Decimal('0'))
+        item.rollover_expiry_days = f.integer('rollover_expiry_days', item.rollover_expiry_days, minimum=0)
+        # Unticked checkboxes post nothing; `contract_flags` marks that the
+        # form rendered them, so their absence means "off" only then.
+        item.auto_renew = f.flag('auto_renew', item.auto_renew, 'contract_flags')
+        item.proration_enabled = f.flag('proration_enabled', item.proration_enabled, 'contract_flags')
+        item.auto_renew_period_months = f.integer('auto_renew_period_months', item.auto_renew_period_months,
+                                                  blank=12, minimum=1) or 12
+        item.billable_role_codes = f.csv_list('billable_role_codes', item.billable_role_codes or [])
+        item.excluded_role_codes = f.csv_list('excluded_role_codes', item.excluded_role_codes or [])
 
         # SLA matrix — POST keys are sla_<code>_response and sla_<code>_resolution.
-        # Empty string = "use priority default" (omit from matrix).
-        matrix = {}
+        # Blank = "use priority default" (drop the override); a key the POST
+        # does not carry, or a value that is not a number, keeps the saved one.
+        matrix = {code: dict(entry) for code, entry in (item.sla_matrix or {}).items()
+                  if isinstance(entry, dict)}
         for p in TicketPriority.objects.all():
-            r_raw = request.POST.get(f'sla_{p.code}_response') or ''
-            x_raw = request.POST.get(f'sla_{p.code}_resolution') or ''
-            entry = {}
-            if r_raw.strip():
-                try:
-                    entry['response_minutes'] = max(0, int(r_raw))
-                except ValueError:
-                    pass
-            if x_raw.strip():
-                try:
-                    entry['resolution_minutes'] = max(0, int(x_raw))
-                except ValueError:
-                    pass
+            entry = matrix.get(p.code, {})
+            for kind in ('response', 'resolution'):
+                key = f'{kind}_minutes'
+                value = f.integer(f'sla_{p.code}_{kind}', entry.get(key), blank=None, minimum=0)
+                if value is None:
+                    entry.pop(key, None)
+                else:
+                    entry[key] = value
             if entry:
                 matrix[p.code] = entry
+            else:
+                matrix.pop(p.code, None)
         item.sla_matrix = matrix
         item.save()
         # Window, client and role gates all decide which time entries count
@@ -3304,35 +3423,42 @@ def contract_form(request, pk=None):
         # silently delete a bundle the form had never even shown as removed.
         # Auto-renewal copies bundle items onto the renewal contract, so rows
         # can exist without this form ever having created them.
-        bundle_json = request.POST.get('bundle_items_json')
-        if bundle_json is None:
-            bundle_rows = None
-        else:
+        #
+        # An empty string is the editor's untouched state too: the hidden
+        # field renders blank and is only filled once the editor serializes,
+        # so a blank value means "no bundle submitted", never "clear it". The
+        # editor posts `[]` when the user removes every row.
+        bundle_json = (request.POST.get('bundle_items_json') or '').strip()
+        bundle_rows = None
+        if bundle_json:
             try:
-                bundle_rows = json.loads(bundle_json or '[]')
+                bundle_rows = json.loads(bundle_json)
             except (ValueError, TypeError):
-                bundle_rows = None
+                f.malformed.append('bundled services')
 
         if isinstance(bundle_rows, list):
             from psa.models import ContractBundleItem
             from decimal import Decimal, InvalidOperation
 
+            def _row_decimal(row, key, current):
+                raw = row.get(key)
+                if raw is None or str(raw).strip() == '':
+                    return current
+                try:
+                    value = Decimal(str(raw).strip())
+                except (InvalidOperation, ValueError):
+                    f.malformed.append(f'bundled service {key.replace("_", " ")}')
+                    return current
+                if not value.is_finite() or value < 0:
+                    f.malformed.append(f'bundled service {key.replace("_", " ")}')
+                    return current
+                return value
+
+            periods = ('one_time', 'monthly', 'quarterly', 'yearly')
             seen_pks = set()
             for i, row in enumerate(bundle_rows):
                 if not isinstance(row, dict):
                     continue
-                row_name = (row.get('name') or '').strip()
-                if not row_name:
-                    continue
-                try:
-                    qty = Decimal(str(row.get('quantity') or '1'))
-                    price = Decimal(str(row.get('unit_price') or '0'))
-                except InvalidOperation:
-                    qty, price = Decimal('1'), Decimal('0')
-                period = row.get('recurring_period') or 'monthly'
-                if period not in ('one_time', 'monthly', 'quarterly', 'yearly'):
-                    period = 'monthly'
-
                 row_pk = row.get('pk') or ''
                 existing = None
                 if row_pk:
@@ -3342,10 +3468,27 @@ def contract_form(request, pk=None):
                         ).first()
                     except (ValueError, TypeError):
                         existing = None
+                row_name = str(row.get('name') or '').strip()
+                if not row_name:
+                    # A row that still names an existing line but carries no
+                    # name is malformed, not a removal — removing a line drops
+                    # it from the list. Keep it as saved.
+                    if existing:
+                        seen_pks.add(existing.pk)
+                    continue
+                qty = _row_decimal(row, 'quantity', existing.quantity if existing else Decimal('1'))
+                price = _row_decimal(row, 'unit_price', existing.unit_price if existing else Decimal('0'))
+                period = row.get('recurring_period')
+                if period not in periods:
+                    period = existing.recurring_period if existing else 'monthly'
+                unit_label = row.get('unit_label')
+                if unit_label is None:
+                    unit_label = existing.unit_label if existing else ''
+
                 if existing:
                     existing.name = row_name[:200]
                     existing.quantity = qty
-                    existing.unit_label = (row.get('unit_label') or '')[:40]
+                    existing.unit_label = str(unit_label)[:40]
                     existing.unit_price = price
                     existing.recurring_period = period
                     existing.sort_order = i
@@ -3356,7 +3499,7 @@ def contract_form(request, pk=None):
                         contract=item,
                         name=row_name[:200],
                         quantity=qty,
-                        unit_label=(row.get('unit_label') or '')[:40],
+                        unit_label=str(unit_label)[:40],
                         unit_price=price,
                         recurring_period=period,
                         sort_order=i,
@@ -3374,6 +3517,7 @@ def contract_form(request, pk=None):
             description=f'{"Updated" if pk else "Created"} contract "{item.name}"',
             ip_address=_client_ip(request), path=request.path,
         )
+        f.warn(request, f'Saved "{item.name}"')
         messages.success(request, f'Saved "{item.name}".')
         return redirect('psa:contract_detail', pk=item.pk)
 
@@ -3721,6 +3865,13 @@ def quote_form(request, pk=None):
     if pk:
         item = get_object_or_404(_for_customer(request, Quote.objects.all()), pk=pk)
         org = item.organization
+        if item.is_signature_locked:
+            # The signature is bound to this exact content (lines, totals,
+            # terms): changing it would make the signature describe a quote
+            # the customer never saw.
+            messages.error(request, f'Quote {item.quote_number} was signed by the customer, so it can no '
+                                    'longer be edited. Create a new quote for any change.')
+            return redirect('psa:quote_detail', pk=item.pk)
     else:
         item = None
         org = get_request_organization(request)
@@ -3755,14 +3906,16 @@ def quote_form(request, pk=None):
             messages.error(request, 'Please choose a client for this quote.')
             return _render()
 
-        title = (request.POST.get('title') or '').strip()
-        client_org_id = request.POST.get('client_org')
+        # On an edit, a POST that does not carry the title or client keeps
+        # the saved ones; posting either blank is still refused.
+        title = (request.POST.get('title', item.title if item else '') or '').strip()
+        client_org_id = request.POST.get('client_org', str(item.client_org_id) if item else '')
         if not title or not client_org_id:
             messages.error(request, 'Title and client are required.')
             return _render(selected_org_id=item_org.pk)
         try:
             client_org = _customer_orgs(request).get(pk=client_org_id)
-        except Organization.DoesNotExist:
+        except (Organization.DoesNotExist, ValueError, TypeError):
             messages.error(request, 'Client not found.')
             return _render(selected_org_id=item_org.pk)
 
@@ -3773,35 +3926,56 @@ def quote_form(request, pk=None):
             item.organization = item_org
             item.client_org = client_org
             item.title = title
-        item.description = (request.POST.get('description') or '').strip()
-        item.status = request.POST.get('status') or 'draft'
-        item.valid_until = request.POST.get('valid_until') or None
-        try:
-            item.tax_rate = request.POST.get('tax_rate') or 0
-        except (TypeError, ValueError):
-            item.tax_rate = 0
+        # Missing fields keep the saved value, malformed ones too (reported);
+        # only a field posted blank clears (see psa/form_fields.py).
+        from decimal import Decimal
+        from .form_fields import PostedFields
+        f = PostedFields(request.POST)
+        item.description = f.text('description', item.description or '')
+        item.status = f.choice('status', item.status or 'draft', dict(Quote.STATUS_CHOICES))
+        item.valid_until = f.date('valid_until', item.valid_until, blank=None)
+        if not pk:
+            default_tax = SystemSetting.get_settings().psa_default_tax_rate or Decimal('0')
+        else:
+            default_tax = item.tax_rate
+        item.tax_rate = f.decimal('tax_rate', default_tax, minimum=Decimal('0'), maximum=Decimal('1'))
         item.save()
 
-        # Replace line items if posted
+        # Replace line items if posted. No `li_description` at all leaves
+        # the lines alone; so does a submission whose columns do not line up
+        # or that carries a quantity or price that is not a number — the
+        # lines are replaced wholesale, so a partly-readable set would lose
+        # rows. Removing the last row in the editor blanks it, which clears.
         line_descs = request.POST.getlist('li_description')
         line_qtys = request.POST.getlist('li_quantity')
         line_prices = request.POST.getlist('li_unit_price')
+        rows = None
         if line_descs:
+            if len(line_qtys) != len(line_descs) or len(line_prices) != len(line_descs):
+                f.malformed.append('line items')
+            else:
+                rows = []
+                for d, q, p in zip(line_descs, line_qtys, line_prices):
+                    if not (d or '').strip():
+                        continue
+                    bad = []
+                    qd = _parse_line_decimal(q, Decimal('1'), bad, 'line quantity')
+                    pd = _parse_line_decimal(p, Decimal('0'), bad, 'line unit price')
+                    if bad:
+                        f.malformed.extend(bad)
+                        rows = None
+                        break
+                    rows.append((d.strip()[:300], qd, pd))
+        if rows is not None:
             item.line_items.all().delete()
-            for i, (d, q, p) in enumerate(zip(line_descs, line_qtys, line_prices)):
-                if not (d or '').strip():
-                    continue
-                try:
-                    qf = float(q or 1)
-                    pf = float(p or 0)
-                except ValueError:
-                    qf, pf = 1, 0
+            for i, (d, qd, pd) in enumerate(rows):
                 QuoteLineItem.objects.create(
                     quote=item, sort_order=i,
-                    description=d.strip()[:300], quantity=qf, unit_price=pf,
+                    description=d, quantity=qd, unit_price=pd,
                 )
         item.recompute_totals()
 
+        f.warn(request, f'Saved "{item.quote_number}"')
         messages.success(request, f'Saved "{item.quote_number}".')
         return redirect('psa:quote_list')
 
@@ -4256,35 +4430,33 @@ def workflow_suggestion_decide(request, pk):
 def workflow_rule_form(request, pk=None):
     """Create/edit an MSP-level workflow rule. The rule's organization is
     optional — leave blank to apply to every client's tickets, or pick a
-    specific client to scope it. No 'pick a client first' requirement."""
+    specific client to scope it. No 'pick a client first' requirement.
+
+    Phase 14: the builder edits both branches (then / otherwise), chained
+    rules (fire_rule) and the once-per-ticket guard. The definition is
+    validated (action types, required settings, fire_rule targets, loops)
+    before it is saved; on an error the form comes back with what was
+    entered."""
     from .models import WorkflowRule
     from core.models import Organization
+    from . import workflow_graph
     import json as _json
     item = get_object_or_404(WorkflowRule, pk=pk) if pk else None
 
     if request.method == 'POST':
+        errors = []
         name = (request.POST.get('name') or '').strip()
         trigger = request.POST.get('trigger') or ''
         if not name or trigger not in {c[0] for c in WorkflowRule.TRIGGER_CHOICES}:
-            messages.error(request, 'Name and a valid trigger are required.')
-            return redirect(request.path)
-        try:
-            conditions = _json.loads(request.POST.get('conditions') or '{}')
-        except _json.JSONDecodeError:
-            messages.error(request, 'Conditions must be valid JSON.')
-            return redirect(request.path)
-        try:
-            actions = _json.loads(request.POST.get('actions') or '[]')
-        except _json.JSONDecodeError:
-            messages.error(request, 'Actions must be valid JSON.')
-            return redirect(request.path)
-        if not isinstance(conditions, dict):
-            messages.error(request, 'Conditions must be a JSON object.')
-            return redirect(request.path)
-        if not isinstance(actions, list):
-            messages.error(request, 'Actions must be a JSON list.')
-            return redirect(request.path)
-
+            errors.append('Name and a valid trigger are required.')
+        parsed = {}
+        for field, default, label in (('conditions', '{}', 'Conditions'), ('actions', '[]', 'Actions'),
+                                      ('else_actions', '[]', 'Otherwise actions')):
+            try:
+                parsed[field] = _json.loads(request.POST.get(field) or default)
+            except _json.JSONDecodeError:
+                errors.append(f'{label} must be valid JSON.')
+                parsed[field] = None
         # Optional client scope
         scoped_org = None
         org_id = (request.POST.get('organization') or '').strip()
@@ -4293,6 +4465,22 @@ def workflow_rule_form(request, pk=None):
                 scoped_org = Organization.objects.get(pk=int(org_id))
             except (Organization.DoesNotExist, ValueError):
                 scoped_org = None
+        if not errors:
+            errors = workflow_graph.validate(name, parsed['conditions'], parsed['actions'],
+                                             parsed['else_actions'], rule=item, organization=scoped_org)
+        if errors:
+            for e in errors:
+                messages.error(request, e)
+            return _workflow_rule_form_render(request, item, posted={
+                'name': name, 'trigger': trigger, 'description': request.POST.get('description') or '',
+                'organization_id': scoped_org.pk if scoped_org else None,
+                'is_active': request.POST.get('is_active') == 'on',
+                'fire_once_per_ticket': request.POST.get('fire_once_per_ticket') == 'on',
+                'sort_order': request.POST.get('sort_order') or 0,
+                'conditions': request.POST.get('conditions') or '{}',
+                'actions': request.POST.get('actions') or '[]',
+                'else_actions': request.POST.get('else_actions') or '[]',
+            })
 
         if item is None:
             item = WorkflowRule(name=name, trigger=trigger, created_by=request.user,
@@ -4302,9 +4490,11 @@ def workflow_rule_form(request, pk=None):
             item.trigger = trigger
             item.organization = scoped_org
         item.description = (request.POST.get('description') or '').strip()
-        item.conditions = conditions
-        item.actions = actions
+        item.conditions = parsed['conditions']
+        item.actions = parsed['actions']
+        item.else_actions = parsed['else_actions']
         item.is_active = request.POST.get('is_active') == 'on'
+        item.fire_once_per_ticket = request.POST.get('fire_once_per_ticket') == 'on'
         try:
             item.sort_order = max(0, int(request.POST.get('sort_order') or 0))
         except ValueError:
@@ -4313,17 +4503,78 @@ def workflow_rule_form(request, pk=None):
         messages.success(request, f'Saved rule "{item.name}".')
         return redirect('psa:workflow_rule_list')
 
+    return _workflow_rule_form_render(request, item)
+
+
+def _workflow_rule_form_render(request, item, posted=None):
+    from django.contrib.auth.models import Group
+    from .models import WorkflowRule
+    from core.models import Organization
+    from . import workflow_graph
+    import json as _json
+
+    def pretty(raw, fallback):
+        try:
+            return _json.dumps(_json.loads(raw), indent=2)
+        except (TypeError, ValueError):
+            return raw if isinstance(raw, str) else _json.dumps(fallback)
+
+    if posted is not None:
+        state = dict(posted)
+        conditions_pretty = pretty(posted['conditions'], {})
+        actions_pretty = pretty(posted['actions'], [])
+        else_pretty = pretty(posted['else_actions'], [])
+    else:
+        state = {
+            'name': item.name if item else '', 'trigger': item.trigger if item else '',
+            'description': item.description if item else '',
+            'organization_id': item.organization_id if item else None,
+            'is_active': item.is_active if item else True,
+            'fire_once_per_ticket': item.fire_once_per_ticket if item else False,
+            'sort_order': item.sort_order if item else 0,
+        }
+        conditions_pretty = _json.dumps(item.conditions if item else {}, indent=2)
+        actions_pretty = _json.dumps(item.actions if item else [], indent=2)
+        else_pretty = _json.dumps(item.else_actions if item else [], indent=2)
     return render(request, 'psa/workflow_rule_form.html', {
         'item': item,
+        'state': state,
         'trigger_choices': WorkflowRule.TRIGGER_CHOICES,
-        'conditions_pretty': _json.dumps(item.conditions if item else {}, indent=2),
-        'actions_pretty': _json.dumps(item.actions if item else [], indent=2),
-        'conditions_json': _json.dumps(item.conditions if item else {}),
-        'actions_json': _json.dumps(item.actions if item else []),
+        'conditions_pretty': conditions_pretty,
+        'actions_pretty': actions_pretty,
+        'else_actions_pretty': else_pretty,
         'client_orgs': Organization.objects.filter(is_active=True).order_by('name'),
         'priorities': TicketPriority.objects.all().order_by('sort_order'),
         'queues': Queue.objects.filter(is_active=True).order_by('name'),
         'statuses': TicketStatus.objects.all().order_by('sort_order'),
+        # Group names offered to the round-robin / skill / least-loaded actions.
+        'groups': list(Group.objects.order_by('name').values_list('name', flat=True)),
+        # Rules a "Run another rule" step can chain to.
+        'rule_names': list(workflow_graph.rule_choices(exclude_pk=item.pk if item else None)),
+    }, status=400 if posted is not None else 200)
+
+
+@login_required
+@require_admin
+@require_psa_enabled
+def workflow_rule_flow(request, pk=None):
+    """Phase 14: the visual flow of one rule (pk) or of every rule, with
+    the rules each one chains to drawn inline and problems (missing
+    targets, loops) flagged."""
+    from .models import WorkflowRule
+    from . import workflow_graph
+    if pk:
+        rules = [get_object_or_404(WorkflowRule, pk=pk)]
+    else:
+        rules = list(WorkflowRule.objects.select_related('organization').order_by('trigger', 'sort_order', 'name'))
+    chained = workflow_graph.chained_into(rules) if not pk else set()
+    flows = []
+    for rule in rules:
+        flow = workflow_graph.build_flow(rule)
+        flows.append({'flow': flow, 'problems': workflow_graph.problems(flow),
+                      'only_chained': rule.name in chained})
+    return render(request, 'psa/workflow_rule_flow.html', {
+        'flows': flows, 'single': bool(pk), 'trigger_labels': dict(WorkflowRule.TRIGGER_CHOICES),
     })
 
 
@@ -4401,6 +4652,19 @@ def _dispatch_conflicts(tech_user, ticket):
     except Exception:  # noqa: BLE001 — resourcing may be absent
         pass
 
+    # Shift schedule: a technician with a weekly schedule who is not on a
+    # shift when the ticket is due. Technicians without one are not checked.
+    try:
+        from resourcing.shifts import has_schedule, shift_at, user_tz
+        local_due = due.astimezone(user_tz(tech_user))
+        if has_schedule(tech_user, on=local_due.date()) and shift_at(tech_user, due) is None:
+            warnings.append(
+                f'Shift conflict: {tech_user.username} has no scheduled shift at '
+                f'{local_due.strftime("%a %H:%M")}'
+            )
+    except Exception:  # noqa: BLE001 — resourcing may be absent
+        pass
+
     # Calendar overlap. Window = ±2 hours. Excludes the ticket itself
     # and any closed/cancelled tickets.
     from datetime import timedelta
@@ -4421,6 +4685,97 @@ def _dispatch_conflicts(tech_user, ticket):
                 f'{other.ticket_number} due {other_due.strftime("%H:%M %Z")}'.rstrip()
             )
     return warnings
+
+
+def _dispatch_geo(rows, open_unassigned):
+    """Attach `position` to each technician row and return ({ticket_pk:
+    'tech · 3.1 mi · ~8 min'}, enabled). Straight-line estimates only; never
+    raises."""
+    try:
+        from field_ops import geo_dispatch
+        cfg = geo_dispatch.load_settings()
+        if not cfg.enabled:
+            return {}, False
+        techs = [r['tech'] for r in rows if r['is_tech']]
+        pos = geo_dispatch.positions(techs, cfg=cfg)
+        for r in rows:
+            r['position'] = pos.get(r['tech'].pk)
+        located = [r['tech'] for r in rows if r.get('position') is not None]
+        out = {}
+        if located:
+            for t in open_unassigned[:200]:
+                point = geo_dispatch.site_point(t)
+                if point is None:
+                    continue
+                best = min(((u, geo_dispatch.estimate(pos[u.pk], point, cfg)) for u in located),
+                           key=lambda r: (r[1].distance_km, r[0].pk))
+                out[t.pk] = f'{best[0].username} · {best[1].label}'
+        return out, True
+    except Exception:  # noqa: BLE001 — geo is advisory
+        logger.exception('dispatch geo lookup failed')
+        return {}, False
+
+
+def _dispatch_shift_info(users, days):
+    """{user_id: {'now': label or '', 'days': [[labels]], 'conflicts': [str]}}
+    from the weekly shift schedule. Never raises."""
+    out = {}
+    try:
+        from resourcing.shifts import shift_at, week_grid
+        techs = [u for u in users if u.is_active]
+        for row in week_grid(techs, days[0], len(days)):
+            u = row['user']
+            if not any(c['shifts'] for c in row['cells']):
+                continue
+            current = shift_at(u)
+            out[u.id] = {
+                'now': current.label if current else '',
+                'days': [[s.label for s in c['shifts']] for c in row['cells']],
+                'conflicts': [c['conflict'] for c in row['cells']],
+            }
+    except Exception:  # noqa: BLE001 — resourcing may be absent
+        logger.exception('dispatch shift lookup failed')
+    return out
+
+
+@login_required
+@require_psa_enabled
+def dispatch_travel(request, ticket_number):
+    """JSON travel estimates from each technician's last shared position to
+    the ticket's site. Staff dispatchers only. Straight-line by default; with
+    `?road=1` and a routing server configured by the administrator, the five
+    nearest are refined through it. Never exposed to customers."""
+    _staff_or_403(request)
+    org = get_request_organization(request)
+    qs = Ticket.objects.select_related('organization', 'site')
+    if org is not None:
+        qs = qs.filter(organization=org)
+    ticket = get_object_or_404(qs, ticket_number=ticket_number)
+    if not _can_assign(request, ticket.organization):
+        from django.core.exceptions import PermissionDenied
+        raise PermissionDenied('Not allowed to dispatch this ticket.')
+    from field_ops import geo_dispatch
+    cfg = geo_dispatch.load_settings()
+    if not cfg.enabled:
+        return JsonResponse({'enabled': False, 'site': None, 'technicians': []})
+    from psa.visibility import msp_technicians
+    ranked, missing, point = geo_dispatch.nearest(ticket, list(msp_technicians()), cfg=cfg)
+    if point is None:
+        return JsonResponse({'enabled': True, 'site': None, 'technicians': [],
+                             'error': 'The ticket has no site with coordinates.'})
+    road = request.GET.get('road') == '1'
+    pos = geo_dispatch.positions([u for u, _ in ranked], cfg=cfg) if road else {}
+    out = []
+    for i, (u, est) in enumerate(ranked):
+        if road and i < 5:
+            est = geo_dispatch.road_estimate(pos[u.pk], point, cfg)
+        out.append({'user_id': u.pk, 'username': u.username, **est.as_dict()})
+    AuditLog.log(user=request.user, action='read', organization=ticket.organization,
+                 object_type='psa.Ticket', object_id=ticket.pk, object_repr=ticket.ticket_number,
+                 description=f'Travel estimates viewed for {ticket.ticket_number}'
+                             + (' (road estimates)' if road else ''), path=request.path)
+    return JsonResponse({'enabled': True, 'site': point[2], 'technicians': out,
+                         'without_position': len(missing)})
 
 
 @login_required
@@ -4511,15 +4866,34 @@ def dispatch_board(request):
     # the row is flagged and can't receive drops.
     from psa.visibility import is_msp_staff
     techs_sorted = sorted(techs.values(), key=lambda u: (u.username or '').lower())
+    shift_info = _dispatch_shift_info(techs_sorted, days)
     rows = []
     for u in techs_sorted:
+        info = shift_info.get(u.id, {})
         rows.append({
             'tech': u,
             'is_tech': bool(u.is_active and is_msp_staff(u)),
             'cells': [cells.get((u.id, d), []) for d in days],
             'other': cells.get((u.id, OTHER), []),
+            # Phase 11 — shift schedule: today's shift(s), per-day labels and
+            # PTO clashes. Empty for technicians without a schedule.
+            'shift_now': info.get('now'),
+            'day_cells': list(zip(
+                [cells.get((u.id, d), []) for d in days],
+                info.get('days', [[] for _ in days]),
+                info.get('conflicts', ['' for _ in days]))),
         })
     rows.sort(key=lambda r: (not r['is_tech'], (r['tech'].username or '').lower()))
+
+    # Geo-aware dispatch (opt-in per technician, off unless switched on):
+    # last shared position per tech row and, on open unassigned tickets, the
+    # nearest technician by straight-line estimate. No network call here.
+    nearest_by_ticket = {}
+    geo_enabled = False
+    if can_assign:
+        nearest_by_ticket, geo_enabled = _dispatch_geo(rows, [
+            t for lane in list(unassigned_by_day.values()) + [overdue]
+            for t in lane if not t.assigned_to_id and not (t.status_id and t.status.is_terminal)])
 
     # Phase 2.3 — skill ranking. For each ticket card, top 5 candidates
     # by skill+availability score. Only computed for admins who can assign.
@@ -4556,6 +4930,8 @@ def dispatch_board(request):
         'sla_burn': sla_burn,  # Phase 11.1
         'can_assign': can_assign,
         'skill_rankings': skill_rankings,
+        'nearest_by_ticket': nearest_by_ticket,
+        'geo_enabled': geo_enabled,
     })
 
 
@@ -4585,9 +4961,30 @@ def invoice_list(request):
     status = request.GET.get('status')
     if status in {'draft', 'sent', 'partial', 'paid', 'overdue', 'void'}:
         qs = qs.filter(status=status)
+    # Billed-customer filter and search (saved views:
+    # core.workspace SAVED_VIEW_LISTS['invoices']). Choices come from the
+    # already-scoped list, so a filter can only hide rows.
+    client_ids = set(qs.values_list('client_org_id', flat=True).distinct()) - {None}
+    client = request.GET.get('client') or ''
+    if client.isdigit() and int(client) in client_ids:
+        qs = qs.filter(client_org_id=int(client))
+    else:
+        client = ''
+    q = (request.GET.get('q') or '').strip()[:100]
+    if q:
+        from django.db.models import Q
+        qs = qs.filter(Q(invoice_number__icontains=q) | Q(title__icontains=q))
+    clients = []
+    if len(client_ids) > 1:
+        from core.models import Organization
+        clients = list(Organization.objects.filter(pk__in=client_ids).order_by('name').values('pk', 'name'))
     return render(request, 'psa/invoice_list.html', {
         'invoices': qs.order_by('-invoice_date', '-created_at')[:200],
         'status_filter': status or '',
+        'client_filter': client,
+        'clients': clients,
+        'q': q,
+        'has_filters': bool(status or client or q),
     })
 
 
@@ -4609,6 +5006,16 @@ def _require_invoice_view(request, invoice):
     if not (has_perm_for_org(request.user, invoice.client_org_id, 'billing_view_invoices')
             or has_perm_for_org(request.user, invoice.organization_id, 'billing_view_invoices')):
         raise PermissionDenied("You don't have the 'billing_view_invoices' permission for this customer.")
+
+
+def _require_invoice_flag(request, invoice, flag):
+    """403 unless the user holds `flag` for the customer billed (or the
+    customer the invoice is booked under); `_require_invoice_view`'s rule
+    for the other billing flags."""
+    from accounts.permission_utils import has_perm_for_org
+    if not (has_perm_for_org(request.user, invoice.client_org_id, flag)
+            or has_perm_for_org(request.user, invoice.organization_id, flag)):
+        raise PermissionDenied(f"You don't have the '{flag}' permission for this customer.")
 
 
 @login_required
@@ -4641,15 +5048,35 @@ def _parse_decimal(raw, default):
         return Decimal(default)
 
 
-def _sync_invoice_lines(invoice, descs, qtys, prices, ids):
+def _parse_line_decimal(raw, current, malformed, label):
+    """A line's quantity or price: blank → `current`, malformed → `current`
+    (noted in `malformed`), otherwise the posted value."""
+    from decimal import Decimal, InvalidOperation
+    text = str(raw or '').strip()
+    if not text:
+        return current
+    try:
+        value = Decimal(text)
+    except (InvalidOperation, ValueError):
+        value = None
+    if value is None or not value.is_finite():
+        if malformed is not None:
+            malformed.append(label)
+        return current
+    return value
+
+
+def _sync_invoice_lines(invoice, descs, qtys, prices, ids, malformed=None):
     """Apply the invoice form's line rows to `invoice` by line id.
 
     A row carrying the id of one of this invoice's lines updates that line in
     place (source, source_id, is_taxable and gl_account_code untouched). A row
     with no id — or an id that is not this invoice's — becomes a new manual
     line. Lines whose id no row carries, or whose row was blanked, are
-    deleted.
+    deleted. A quantity or price that is blank or not a number keeps the
+    line's saved value (1 and 0 for a new line).
     """
+    from decimal import Decimal
     from .models import InvoiceLineItem
     existing = {li.pk: li for li in invoice.line_items.all()}
     kept = set()
@@ -4661,13 +5088,15 @@ def _sync_invoice_lines(invoice, descs, qtys, prices, ids):
         d = (d or '').strip()
         if not d:
             continue
-        qty = _parse_decimal(q, '1')
-        price = _parse_decimal(p, '0')
         try:
             line_id = int(raw_id)
         except (TypeError, ValueError):
             line_id = None
         line = existing.get(line_id)
+        qty = _parse_line_decimal(q, line.quantity if line is not None else Decimal('1'),
+                                  malformed, 'line quantity')
+        price = _parse_line_decimal(p, line.unit_price if line is not None else Decimal('0'),
+                                    malformed, 'line unit price')
         if line is not None and line_id not in kept:
             line.sort_order = i
             line.description = d[:300]
@@ -4781,14 +5210,25 @@ def invoice_form(request, pk=None):
     from .models import Invoice, InvoiceLineItem
     from core.models import Organization, SystemSetting
     from datetime import date as _date
+    # Creating or editing an invoice needs `billing_send_invoices` (there is
+    # no separate invoice-edit flag) for its customer; customer users reach
+    # only their own customers' invoices.
+    from accounts.permission_utils import has_perm_for_org, orgs_with_perm
+    may_bill = orgs_with_perm(request.user, 'billing_send_invoices')
     if pk:
-        item = get_object_or_404(_for_customer(request, Invoice.objects.all()), pk=pk)
+        item = get_object_or_404(
+            _invoices_for_customer(request, _for_customer(request, Invoice.objects.all())), pk=pk)
+        _require_invoice_flag(request, item, 'billing_send_invoices')
         org = item.organization
     else:
+        if may_bill is not None and not may_bill:
+            raise PermissionDenied("You don't have the 'billing_send_invoices' permission.")
         item = None
         org = get_request_organization(request)
 
     client_orgs = _customer_orgs(request).filter(is_active=True).order_by('name')
+    if may_bill is not None:
+        client_orgs = client_orgs.filter(pk__in=may_bill)
 
     # An invoice that has gone to the customer (or been voided) is a record,
     # not a draft: its amounts and details change only through a credit memo
@@ -4830,16 +5270,21 @@ def invoice_form(request, pk=None):
             messages.error(request, 'Please choose a client for this invoice.')
             return _render()
 
-        title = (request.POST.get('title') or '').strip()
-        client_org_id = request.POST.get('client_org')
+        # On an edit, a POST that does not carry the title or client keeps
+        # the saved ones; posting either blank is still refused.
+        title = (request.POST.get('title', item.title if item else '') or '').strip()
+        client_org_id = request.POST.get('client_org', str(item.client_org_id) if item else '')
         if not title or not client_org_id:
             messages.error(request, 'Title and client are required.')
             return _render(selected_org_id=item_org.pk)
         try:
             client_org = _customer_orgs(request).get(pk=client_org_id)
-        except Organization.DoesNotExist:
+        except (Organization.DoesNotExist, ValueError, TypeError):
             messages.error(request, 'Client not found.')
             return _render(selected_org_id=item_org.pk)
+        if not (has_perm_for_org(request.user, client_org, 'billing_send_invoices')
+                or has_perm_for_org(request.user, item_org, 'billing_send_invoices')):
+            raise PermissionDenied("You don't have the 'billing_send_invoices' permission for this customer.")
 
         if item is None:
             item = Invoice(organization=item_org, client_org=client_org, title=title,
@@ -4848,22 +5293,30 @@ def invoice_form(request, pk=None):
             item.organization = item_org
             item.client_org = client_org
             item.title = title
-        item.description = (request.POST.get('description') or '').strip()
+        # A field the POST does not carry keeps the saved value; a malformed
+        # one keeps it too and is reported. Only a field posted blank clears
+        # (see psa/form_fields.py).
+        from decimal import Decimal
+        from .form_fields import PostedFields
+        f = PostedFields(request.POST)
+        item.description = f.text('description', item.description or '')
         # Only drafts reach this path (see `locked` above). The invoice is
         # saved as a draft first and moved to the requested status only after
         # its totals — and so the approval gate — have been re-evaluated.
-        requested_status = request.POST.get('status') or 'draft'
-        if requested_status not in dict(Invoice.STATUS_CHOICES):
-            requested_status = 'draft'
+        requested_status = f.choice('status', 'draft', dict(Invoice.STATUS_CHOICES))
         item.status = 'draft'
-        item.invoice_date = request.POST.get('invoice_date') or item.invoice_date
-        item.due_date = request.POST.get('due_date') or None
-        item.currency = (request.POST.get('currency') or 'USD')[:8]
-        try:
-            item.tax_rate = request.POST.get('tax_rate') or 0
-        except (TypeError, ValueError):
-            item.tax_rate = 0
-        item.notes = (request.POST.get('notes') or '').strip()
+        item.invoice_date = f.date('invoice_date', item.invoice_date, blank=item.invoice_date)
+        item.due_date = f.date('due_date', item.due_date, blank=None)
+        if pk:
+            default_currency = item.currency or 'USD'
+            default_tax = item.tax_rate
+        else:
+            _settings = SystemSetting.get_settings()
+            default_currency = getattr(_settings, 'psa_default_currency', None) or 'USD'
+            default_tax = getattr(_settings, 'psa_default_tax_rate', None) or Decimal('0')
+        item.currency = (f.text('currency', default_currency) or default_currency)[:8]
+        item.tax_rate = f.decimal('tax_rate', default_tax, minimum=Decimal('0'), maximum=Decimal('1'))
+        item.notes = f.text('notes', item.notes or '')
         total_before = item.total if pk else None
         item.save()
 
@@ -4871,12 +5324,21 @@ def invoice_form(request, pk=None):
         # source/source_id (time entry, expense, contract period...), so an
         # edit does not make billed work look unbilled; new rows are manual;
         # rows removed from the form are deleted.
+        #
+        # No `li_description` at all means the line editor was not submitted:
+        # the lines stay as they are. The editor always posts at least one row
+        # (removing the last one blanks it), so clearing every line is a
+        # single blank row. Columns of different lengths cannot be matched
+        # row by row, so such a submission leaves the lines untouched too.
         descs = request.POST.getlist('li_description')
         if descs:
-            _sync_invoice_lines(item, descs,
-                                request.POST.getlist('li_quantity'),
-                                request.POST.getlist('li_unit_price'),
-                                request.POST.getlist('li_id'))
+            qtys = request.POST.getlist('li_quantity')
+            prices = request.POST.getlist('li_unit_price')
+            ids = request.POST.getlist('li_id')
+            if len(qtys) != len(descs) or len(prices) != len(descs) or (ids and len(ids) != len(descs)):
+                f.malformed.append('line items')
+            else:
+                _sync_invoice_lines(item, descs, qtys, prices, ids, malformed=f.malformed)
         item.recompute_totals()
 
         # An approval covers the amount that was approved. If the total moves
@@ -4917,6 +5379,7 @@ def invoice_form(request, pk=None):
             description=f'{"Updated" if pk else "Created"} invoice {item.invoice_number}{status_note}',
             ip_address=_client_ip(request), path=request.path,
         )
+        f.warn(request, f'Saved {item.invoice_number}')
         messages.success(request, f'Saved {item.invoice_number}.')
         return redirect('psa:invoice_detail', pk=item.pk)
 
@@ -4983,14 +5446,17 @@ def invoice_from_ticket(request, ticket_number):
 @require_write
 @require_psa_enabled
 @require_http_methods(['POST'])
-def payment_add(request, invoice_pk):
+def payment_add(request, pk):
+    """Record a payment. Needs `billing_record_payments` for the invoice's
+    customer; customer users reach only their own customers' invoices."""
     from .models import Invoice, Payment
     from datetime import date as _date
     org = get_request_organization(request)
-    qs = Invoice.objects.all()
+    qs = _invoices_for_customer(request, _for_customer(request, Invoice.objects.all()))
     if org is not None:
         qs = qs.filter(organization=org)
-    invoice = get_object_or_404(qs, pk=invoice_pk)
+    invoice = get_object_or_404(qs, pk=pk)
+    _require_invoice_flag(request, invoice, 'billing_record_payments')
     try:
         amount = float(request.POST.get('amount') or 0)
     except (TypeError, ValueError):
@@ -5040,6 +5506,85 @@ def invoice_approve(request, pk):
     )
     messages.success(request, f'Approved invoice {item.invoice_number}.')
     return redirect('psa:invoice_detail', pk=item.pk)
+
+
+def _billing_review_contracts(request):
+    from .models import Contract
+    org = get_request_organization(request)
+    qs = Contract.objects.all()
+    if org is not None:
+        qs = qs.filter(organization=org)
+    elif not request.user.is_superuser:
+        qs = qs.none()
+    return qs
+
+
+@login_required
+@require_admin
+@require_psa_enabled
+def billing_review(request):
+    """Phase 36: per-cycle agreement billing review — included hours
+    consumed, overage and the draft invoice for every agreement, with
+    approve / hold feeding the pre-invoice approval gate."""
+    from dateutil.relativedelta import relativedelta
+    from . import billing_review as br
+    if not (request.user.is_superuser or is_msp_staff(request.user)):
+        raise Http404
+    start, end = br.parse_cycle(request.GET.get('period'))
+    rows = br.build_rows(br.contracts_for_cycle(_billing_review_contracts(request), start, end), start, end)
+    state = request.GET.get('state') or ''
+    shown = [r for r in rows if not state or r.state == state
+             or (state == 'overage' and r.overage_minutes)
+             or (state == 'none' and r.invoice is None)]
+    return render(request, 'psa/billing_review.html', {
+        'rows': shown, 'summary': br.summary(rows), 'cycle_start': start,
+        'cycle_end': end - relativedelta(days=1), 'period': f'{start:%Y-%m}',
+        'prev_period': f'{start - relativedelta(months=1):%Y-%m}',
+        'next_period': f'{end:%Y-%m}', 'state': state,
+    })
+
+
+@login_required
+@require_admin
+@require_psa_enabled
+@require_http_methods(['POST'])
+def billing_review_decide(request, pk):
+    """Approve or hold one agreement's draft invoice from the billing review."""
+    from . import billing_review as br
+    from .models import Invoice
+    if not (request.user.is_superuser or is_msp_staff(request.user)):
+        raise Http404
+    period = (request.POST.get('period') or '')[:7]
+    back = redirect(reverse('psa:billing_review') + (f'?period={period}' if period else ''))
+    contract_ids = _billing_review_contracts(request).values_list('pk', flat=True)
+    invoice = get_object_or_404(Invoice.objects.filter(source_contract_id__in=contract_ids,
+                                                       is_credit_memo=False), pk=pk)
+    decision = request.POST.get('decision') or ''
+    note = (request.POST.get('note') or '').strip()[:150]
+    if invoice.status != 'draft':
+        messages.error(request, f'{invoice.invoice_number} is already {invoice.get_status_display().lower()}; '
+                                'only draft invoices are reviewed here.')
+        return back
+    if decision == 'approve':
+        was = invoice.approval_reason if invoice.requires_approval else ''
+        br.approve(invoice, user=request.user)
+        description = (f'Approved invoice {invoice.invoice_number} at billing review'
+                       + (f' (was: {was})' if was else '') + (f' — {note}' if note else ''))
+        messages.success(request, f'Approved {invoice.invoice_number}.')
+    elif decision == 'hold':
+        reason = br.hold(invoice, user=request.user, note=note)
+        description = f'Held invoice {invoice.invoice_number}: {reason}'
+        messages.success(request, f'{invoice.invoice_number} is on hold; it cannot be sent until approved.')
+    else:
+        messages.error(request, 'Pick approve or hold.')
+        return back
+    AuditLog.log(
+        user=request.user, action='update', organization=invoice.organization,
+        object_type='psa.Invoice', object_id=invoice.pk, object_repr=invoice.invoice_number,
+        description=description, ip_address=_client_ip(request), path=request.path,
+        extra_data={'event': 'billing_review', 'decision': decision, 'period': period},
+    )
+    return back
 
 
 @login_required
@@ -5375,12 +5920,62 @@ def quote_detail(request, pk):
     if org is not None:
         qs = qs.filter(organization=org)
     item = get_object_or_404(qs, pk=pk)
+    sig = QuoteSignature.objects.filter(quote=item).first()
     return render(request, 'psa/quote_detail.html', {
         'item': item,
         'line_items': item.line_items.all(),
         'can_create_po': user_has_perm(request.user, 'procurement_create_po'),
         'linked_pos': item.purchase_orders.all().order_by('-created_at'),
+        'signature_checks': sig.verify() if sig else {},
     })
+
+
+@login_required
+@require_psa_enabled
+def quote_signature_evidence(request, pk):
+    """ZIP of what the customer signed: content.json (the quote exactly as
+    signed), quote.pdf, signature.png, evidence.json and SHA256SUMS. MSP
+    staff only, same customer scoping as the quote page."""
+    import base64
+    import hashlib
+    import io
+    import zipfile
+    from django.http import HttpResponse
+    _staff_or_403(request)
+    org = get_request_organization(request)
+    qs = Quote.objects.all()
+    if org is not None:
+        qs = qs.filter(organization=org)
+    item = get_object_or_404(qs, pk=pk)
+    sig = get_object_or_404(QuoteSignature, quote=item)
+    if not sig.is_bound:
+        raise Http404('This signature was recorded before signatures were bound to a quote revision.')
+    files = {'content.json': sig.content_json.encode('utf-8'), 'evidence.json': sig.evidence_json()}
+    if sig.pdf:
+        files['quote.pdf'] = bytes(sig.pdf)
+    if sig.signature_data.startswith('data:image/png;base64,'):
+        try:
+            files['signature.png'] = base64.b64decode(sig.signature_data.split(',', 1)[1])
+        except Exception:  # noqa: BLE001
+            pass
+    sums = ''.join(f'{hashlib.sha256(data).hexdigest()}  {name}\n' for name, data in sorted(files.items()))
+    sums += f'# content.json sha256 = content_hash {sig.content_hash}\n'
+    sums += f'# evidence.json sha256 = evidence_hash {sig.evidence_hash}\n'
+    if sig.pdf_hash:
+        sums += f'# quote.pdf sha256 = pdf_hash {sig.pdf_hash}\n'
+    files['SHA256SUMS'] = sums.encode('utf-8')
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
+        for name, data in files.items():
+            z.writestr(name, data)
+    AuditLog.log(user=request.user, action='export', organization=item.organization,
+                 object_type='psa.QuoteSignature', object_id=sig.pk, object_repr=item.quote_number,
+                 description=f'Downloaded signature evidence for quote {item.quote_number}',
+                 ip_address=_client_ip(request), path=request.path)
+    response = HttpResponse(buf.getvalue(), content_type='application/zip')
+    response['Content-Disposition'] = f'attachment; filename="{item.quote_number}-signature-evidence.zip"'
+    response['Cache-Control'] = 'private, no-store'
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -5911,34 +6506,52 @@ from accounts.permission_utils import require_perm, user_has_perm  # noqa: E402
 
 
 def _procurement_save_lines(item, line_model, request):
-    """Replace line_items on a PR/PO from POSTed lists, returning total."""
+    """Replace line_items on a PR/PO from POSTed lists.
+
+    No line fields posted → lines untouched. Columns of different lengths or
+    a malformed quantity/price → lines untouched and the problem returned, so
+    the caller can warn; rows carry no ids, so a bad row can't be matched to
+    the saved line it would replace. Every row blank → lines cleared.
+    Returns a list of problem descriptions (empty when saved).
+    """
+    from decimal import Decimal, InvalidOperation
     descs = request.POST.getlist('li_description')
+    if not descs:
+        return []
     skus = request.POST.getlist('li_sku')
     providers = request.POST.getlist('li_provider')
     qtys = request.POST.getlist('li_quantity')
     prices = request.POST.getlist('li_unit_price')
-    if descs:
-        item.line_items.all().delete()
-        for i, d in enumerate(descs):
-            if not (d or '').strip():
-                continue
-            try:
-                qf = float(qtys[i] if i < len(qtys) and qtys[i] else 1)
-                pf = float(prices[i] if i < len(prices) and prices[i] else 0)
-            except (ValueError, IndexError):
-                qf, pf = 1, 0
-            kwargs = dict(
-                sort_order=i,
-                description=d.strip()[:300],
-                sku=(skus[i] if i < len(skus) else '')[:80],
-                distributor_provider=(providers[i] if i < len(providers) else '')[:40],
-                quantity=qf, unit_price=pf,
-            )
-            if line_model.__name__ == 'PurchaseOrderLineItem':
-                kwargs['po'] = item
-            else:
-                kwargs['requisition'] = item
-            line_model.objects.create(**kwargs)
+    if any(len(col) != len(descs) for col in (qtys, prices)) or \
+            any(col and len(col) != len(descs) for col in (skus, providers)):
+        return ['the line columns did not line up']
+    rows = []
+    for i, d in enumerate(descs):
+        if not (d or '').strip():
+            continue
+        try:
+            qf = Decimal(qtys[i].strip() or '1')
+            pf = Decimal(prices[i].strip() or '0')
+        except (InvalidOperation, ValueError):
+            return [f'line {i + 1} has a quantity or price that is not a number']
+        if not (qf.is_finite() and pf.is_finite()) or qf < 0 or pf < 0:
+            return [f'line {i + 1} has a quantity or price that is not a number']
+        kwargs = dict(
+            sort_order=i,
+            description=d.strip()[:300],
+            sku=(skus[i] if i < len(skus) else '')[:80],
+            distributor_provider=(providers[i] if i < len(providers) else '')[:40],
+            quantity=qf, unit_price=pf,
+        )
+        if line_model.__name__ == 'PurchaseOrderLineItem':
+            kwargs['po'] = item
+        else:
+            kwargs['requisition'] = item
+        rows.append(kwargs)
+    item.line_items.all().delete()
+    for kwargs in rows:
+        line_model.objects.create(**kwargs)
+    return []
 
 
 @login_required
@@ -6003,6 +6616,7 @@ def requisition_detail(request, pk):
 @require_perm('procurement_create_pr')
 @require_http_methods(['GET', 'POST'])
 def requisition_form(request, pk=None):
+    from decimal import Decimal
     from .models import PurchaseRequisition, PurchaseRequisitionLineItem
     from core.models import Organization
     if pk:
@@ -6043,13 +6657,19 @@ def requisition_form(request, pk=None):
             messages.error(request, 'Title is required.')
             return _render()
 
-        client_org = None
-        client_org_id = (request.POST.get('client_org') or '').strip()
-        if client_org_id:
-            try:
-                client_org = _customer_orgs(request).get(pk=int(client_org_id))
-            except (Organization.DoesNotExist, ValueError, TypeError):
-                client_org = None
+        from .form_fields import PostedFields
+        f = PostedFields(request.POST)
+        # Absent keeps the saved client; blank clears it; unknown keeps it.
+        client_org = item.client_org if item else None
+        if f.has('client_org'):
+            client_org_id = (request.POST.get('client_org') or '').strip()
+            client_org = None
+            if client_org_id:
+                try:
+                    client_org = _customer_orgs(request).get(pk=int(client_org_id))
+                except (Organization.DoesNotExist, ValueError, TypeError):
+                    f.malformed.append('client_org')
+                    client_org = item.client_org if item else None
 
         if item is None:
             item = PurchaseRequisition(
@@ -6060,19 +6680,20 @@ def requisition_form(request, pk=None):
         item.organization = item_org
         item.client_org = client_org
         item.title = title
-        item.description = (request.POST.get('description') or '').strip()
-        item.notes = (request.POST.get('notes') or '').strip()
+        item.description = f.text('description', item.description)
+        item.notes = f.text('notes', item.notes)
         # status only changeable if approve/reject — drafts stay draft from form
         if not pk:
             item.status = 'draft'
-        try:
-            item.tax_rate = request.POST.get('tax_rate') or 0
-        except (TypeError, ValueError):
-            item.tax_rate = 0
-        item.currency = (request.POST.get('currency') or 'USD')[:8]
+        # A percentage (8.75 = 8.75%).
+        item.tax_rate = f.decimal('tax_rate', item.tax_rate, minimum=Decimal('0'), maximum=Decimal('100'))
+        item.currency = (f.text('currency', item.currency or 'USD') or 'USD')[:8]
         item.save()
+        f.warn(request, 'Requisition saved')
 
-        _procurement_save_lines(item, PurchaseRequisitionLineItem, request)
+        line_problems = _procurement_save_lines(item, PurchaseRequisitionLineItem, request)
+        if line_problems:
+            messages.warning(request, 'Line items were not changed: ' + '; '.join(line_problems) + '.')
         item.recompute_totals()
         item.save(update_fields=['subtotal', 'tax_amount', 'total', 'updated_at'])
 
@@ -6284,6 +6905,7 @@ def po_detail(request, pk):
 @require_perm('procurement_create_po')
 @require_http_methods(['GET', 'POST'])
 def po_form(request, pk=None):
+    from decimal import Decimal
     from .models import PurchaseOrder, PurchaseOrderLineItem
     from core.models import Organization
     if pk:
@@ -6343,13 +6965,18 @@ def po_form(request, pk=None):
             messages.error(request, 'Title and vendor name are required.')
             return _render()
 
-        client_org = None
-        client_org_id = (request.POST.get('client_org') or '').strip()
-        if client_org_id:
-            try:
-                client_org = _customer_orgs(request).get(pk=int(client_org_id))
-            except (Organization.DoesNotExist, ValueError, TypeError):
-                client_org = None
+        from .form_fields import PostedFields
+        f = PostedFields(request.POST)
+        client_org = item.client_org if item else None
+        if f.has('client_org'):
+            client_org_id = (request.POST.get('client_org') or '').strip()
+            client_org = None
+            if client_org_id:
+                try:
+                    client_org = _customer_orgs(request).get(pk=int(client_org_id))
+                except (Organization.DoesNotExist, ValueError, TypeError):
+                    f.malformed.append('client_org')
+                    client_org = item.client_org if item else None
 
         if item is None:
             item = PurchaseOrder(
@@ -6362,9 +6989,9 @@ def po_form(request, pk=None):
         item.title = title[:200]
         item.vendor_name = vendor_name[:200]
         # Auto-fill snapshot fields from the vendor when the form field is blank
-        posted_vendor_email = (request.POST.get('vendor_email') or '').strip()
-        posted_vendor_phone = (request.POST.get('vendor_phone') or '').strip()
-        posted_vendor_address = (request.POST.get('vendor_address') or '').strip()
+        posted_vendor_email = f.text('vendor_email', item.vendor_email or '')
+        posted_vendor_phone = f.text('vendor_phone', item.vendor_phone or '')
+        posted_vendor_address = f.text('vendor_address', item.vendor_address or '')
         if vendor_obj:
             posted_vendor_email = posted_vendor_email or (vendor_obj.contact_email or '')
             posted_vendor_phone = posted_vendor_phone or (vendor_obj.contact_phone or '')
@@ -6372,12 +6999,13 @@ def po_form(request, pk=None):
         item.vendor_email = posted_vendor_email[:254]
         item.vendor_phone = posted_vendor_phone[:40]
         item.vendor_address = posted_vendor_address
-        item.notes = (request.POST.get('notes') or '').strip()
-        item.status = request.POST.get('status') or 'draft'
-        item.issue_date = request.POST.get('issue_date') or None
+        item.notes = f.text('notes', item.notes)
+        item.status = f.choice('status', item.status or 'draft',
+                               {c[0] for c in PurchaseOrder.STATUS_CHOICES})
+        item.issue_date = f.date('issue_date', item.issue_date)
         # Auto-fill expected delivery from issue_date + vendor lead time when
         # blank and a vendor is set.
-        expected = request.POST.get('expected_delivery_date') or None
+        expected = f.date('expected_delivery_date', item.expected_delivery_date)
         if not expected and vendor_obj and item.issue_date:
             from datetime import timedelta as _td
             try:
@@ -6389,21 +7017,19 @@ def po_form(request, pk=None):
             from datetime import date as _d, timedelta as _td
             expected = (_d.today() + _td(days=vendor_obj.default_lead_time_days)).isoformat()
         item.expected_delivery_date = expected or None
-        item.is_drop_ship = request.POST.get('is_drop_ship') == 'on'
-        item.ship_to_name = (request.POST.get('ship_to_name') or '').strip()[:200]
-        item.ship_to_address = (request.POST.get('ship_to_address') or '').strip()
-        try:
-            item.tax_rate = request.POST.get('tax_rate') or 0
-        except (TypeError, ValueError):
-            item.tax_rate = 0
-        try:
-            item.shipping_cost = request.POST.get('shipping_cost') or 0
-        except (TypeError, ValueError):
-            item.shipping_cost = 0
-        item.currency = (request.POST.get('currency') or 'USD')[:8]
+        # `po_flags` marks that the drop-ship checkbox was rendered.
+        item.is_drop_ship = f.flag('is_drop_ship', item.is_drop_ship, 'po_flags')
+        item.ship_to_name = f.text('ship_to_name', item.ship_to_name or '')[:200]
+        item.ship_to_address = f.text('ship_to_address', item.ship_to_address or '')
+        item.tax_rate = f.decimal('tax_rate', item.tax_rate, minimum=Decimal('0'), maximum=Decimal('100'))
+        item.shipping_cost = f.decimal('shipping_cost', item.shipping_cost, minimum=Decimal('0'))
+        item.currency = (f.text('currency', item.currency or 'USD') or 'USD')[:8]
         item.save()
+        f.warn(request, 'Purchase order saved')
 
-        _procurement_save_lines(item, PurchaseOrderLineItem, request)
+        line_problems = _procurement_save_lines(item, PurchaseOrderLineItem, request)
+        if line_problems:
+            messages.warning(request, 'Line items were not changed: ' + '; '.join(line_problems) + '.')
         item.recompute_totals()
         item.save(update_fields=['subtotal', 'tax_amount', 'total', 'updated_at'])
 
@@ -6522,14 +7148,17 @@ def _maybe_create_assets_from_serials(line, serials, receipt, user):
         return
     org = line.po.client_org or line.po.organization
     for sn in serials:
-        # Skip duplicates
-        if Asset.objects.filter(serial_number=sn).exists():
+        # Skip a serial this customer already has an asset for. Scoped to the
+        # customer: another customer's asset with the same serial is not a
+        # duplicate here (and must not be revealed by skipping).
+        if Asset.objects.filter(organization=org, serial_number=sn).exists():
             continue
         try:
             Asset.objects.create(
                 organization=org,
                 name=f'{line.description} ({sn})'[:200],
                 serial_number=sn,
+                created_by=user if getattr(user, 'is_authenticated', False) else None,
                 notes=f'Auto-created from PO {line.po.po_number} receipt #{receipt.pk}',
                 # status default; let model defaults handle the rest
             )
@@ -6598,10 +7227,18 @@ def po_receive(request, pk):
                 serials_raw = (request.POST.get(f'serials_line_{line.pk}') or '').strip()
                 serials = [s.strip() for s in serials_raw.replace('\n', ',').split(',') if s.strip()]
 
-                POReceiptLine.objects.create(
+                receipt_line = POReceiptLine.objects.create(
                     receipt=receipt, po_line=line,
                     quantity_received=qty, serial_numbers=serials,
                 )
+                # Phase 13: serial lifecycle — the first event of each unit.
+                if serials:
+                    from assets import serial_lifecycle
+                    for sn in serials:
+                        serial_lifecycle.record(
+                            po.client_org or po.organization, sn, 'received',
+                            purchase_order=po, receipt_line=receipt_line, actor=request.user,
+                            notes=f'{po.po_number}: {line.description}'[:500])
                 # Roll up cumulative
                 line.received_quantity = (line.received_quantity or Decimal('0')) + qty
                 line.save(update_fields=['received_quantity'])
@@ -8729,23 +9366,31 @@ def my_timesheet(request, year=None, week=None):
                .filter(user=request.user,
                        started_at__date__gte=period_start,
                        started_at__date__lte=period_end)
-               .select_related('ticket', 'ticket__priority', 'submission')
+               .select_related('ticket', 'ticket__priority', 'submission', 'rejected_by')
                .order_by('started_at'))
 
+    # The week's latest revision. Revision 2+ exists only when entries were
+    # returned from an approved week and then resubmitted.
     submission = (TimesheetSubmission.objects
                   .filter(user=request.user,
                           period_start=period_start, period_end=period_end)
-                  .first())
+                  .order_by('-revision').first())
 
     total_min = sum((e.duration_minutes or 0) for e in entries)
     billable_min = sum((e.duration_minutes or 0) for e in entries if e.is_billable)
+    unsubmitted = [e for e in entries if not e.submission_id]
+    returned = [e for e in unsubmitted if e.rejection_reason or e.rejected_at]
 
     if request.method == 'POST':
-        if submission and submission.status in ('approved', 'pending'):
-            messages.warning(request, f'Already submitted ({submission.status}).')
+        if submission and submission.status == 'pending':
+            messages.warning(request, 'Already submitted (pending).')
             return redirect('psa:my_timesheet_iso', year=period_start.isocalendar()[0],
                             week=period_start.isocalendar()[1])
-        if not entries:
+        if submission and submission.status == 'approved' and not unsubmitted:
+            messages.warning(request, 'Already submitted (approved).')
+            return redirect('psa:my_timesheet_iso', year=period_start.isocalendar()[0],
+                            week=period_start.isocalendar()[1])
+        if not unsubmitted:
             messages.error(request, 'Nothing to submit — log some time first.')
             return redirect('psa:my_timesheet_iso', year=period_start.isocalendar()[0],
                             week=period_start.isocalendar()[1])
@@ -8757,15 +9402,30 @@ def my_timesheet(request, year=None, week=None):
             submission.decided_at = None
             submission.decision_notes = ''
             submission.save()
+        elif submission and submission.status == 'approved':
+            # Returned (or newly logged) entries in an approved week go up as
+            # a new revision; the approved one stays approved and locked.
+            submission = TimesheetSubmission.objects.create(
+                user=request.user,
+                period_start=period_start, period_end=period_end,
+                status='pending', submitter_notes=notes,
+                revision=submission.revision + 1,
+            )
         else:
             submission = TimesheetSubmission.objects.create(
                 user=request.user,
                 period_start=period_start, period_end=period_end,
                 status='pending', submitter_notes=notes,
             )
-        entries.update(submission=submission)
+        TicketTimeEntry.objects.filter(pk__in=[e.pk for e in unsubmitted]).update(
+            submission=submission, rejection_reason='', rejected_at=None,
+            rejected_by=None)
+        from .models import TimeEntryAuditEvent
+        TimeEntryAuditEvent.record_for_entries(
+            unsubmitted, action='submitted', actor=request.user, submission=submission,
+            note=notes)
         messages.success(request,
-            f'Submitted {len(entries)} entries for the week of {period_start}.')
+            f'Submitted {len(unsubmitted)} entries for the week of {period_start}.')
         return redirect('psa:my_timesheet_iso',
                         year=period_start.isocalendar()[0],
                         week=period_start.isocalendar()[1])
@@ -8780,6 +9440,8 @@ def my_timesheet(request, year=None, week=None):
         'total_minutes': total_min,
         'billable_minutes': billable_min,
         'submission': submission,
+        'unsubmitted_count': len(unsubmitted),
+        'returned_entries': returned,
     })
 
 
@@ -8793,13 +9455,35 @@ def timesheet_approval_queue(request):
         messages.error(request, 'Only staff/superuser can review timesheets.')
         return redirect('core:dashboard')
     pending = (TimesheetSubmission.objects.filter(status='pending')
-               .select_related('user').order_by('-submitted_at'))
+               .select_related('user').order_by('-submitted_at')
+               .prefetch_related('entries__ticket', 'entries__audit_events__actor'))
     decided = (TimesheetSubmission.objects
                .exclude(status__in=['pending', 'draft'])
-               .select_related('user', 'decided_by').order_by('-decided_at')[:50])
+               .select_related('user', 'decided_by').prefetch_related('entry_events')
+               .order_by('-decided_at'))
+    # Technician / decision filters (saved views:
+    # core.workspace SAVED_VIEW_LISTS['timesheets']).
+    from django.contrib.auth import get_user_model
+    tech_ids = set(TimesheetSubmission.objects.exclude(status='draft')
+                   .values_list('user_id', flat=True).distinct())
+    tech = request.GET.get('tech') or ''
+    if tech.isdigit() and int(tech) in tech_ids:
+        pending = pending.filter(user_id=int(tech))
+        decided = decided.filter(user_id=int(tech))
+    else:
+        tech = ''
+    decision = request.GET.get('decision') or ''
+    if decision in ('approved', 'rejected'):
+        decided = decided.filter(status=decision)
+    else:
+        decision = ''
     return render(request, 'psa/timesheet_approval_queue.html', {
         'pending': pending,
-        'decided': decided,
+        'decided': decided[:50],
+        'technicians': get_user_model().objects.filter(pk__in=tech_ids).order_by('username'),
+        'tech_filter': tech,
+        'decision_filter': decision,
+        'has_filters': bool(tech or decision),
     })
 
 
@@ -8816,7 +9500,33 @@ def timesheet_decide(request, pk):
     submission = get_object_or_404(TimesheetSubmission, pk=pk, status='pending')
     decision = request.POST.get('decision') or ''
     notes = (request.POST.get('notes') or '').strip()[:5000]
-    if decision == 'approve':
+    # Per-entry returns: `return_entry_ids` (multi) with `return_reason_<id>`
+    # each; the decision notes stand in for a blank reason.
+    returns = {}
+    entry_ids = set(submission.entries.values_list('pk', flat=True))
+    for raw in request.POST.getlist('return_entry_ids'):
+        try:
+            entry_id = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if entry_id in entry_ids:
+            returns[entry_id] = ((request.POST.get(f'return_reason_{entry_id}') or '').strip()
+                                 or notes)[:5000]
+    if returns and decision == 'approve':
+        if not all(returns.values()):
+            messages.error(request, 'Give a reason for each entry you send back.')
+            return redirect('psa:timesheet_approval_queue')
+        outcome = submission.decide_with_returns(returns, user=request.user, notes=notes)
+        if outcome == 'approved':
+            messages.success(request,
+                f'Approved {submission.user.username}\'s week of {submission.period_start}; '
+                f'{len(returns)} entr{"y" if len(returns) == 1 else "ies"} sent back to fix '
+                f'and resubmit.')
+        else:
+            messages.success(request,
+                f'Every entry was sent back, so {submission.user.username}\'s week of '
+                f'{submission.period_start} is rejected.')
+    elif decision == 'approve':
         submission.approve(user=request.user, notes=notes)
         messages.success(request,
             f'Approved {submission.user.username}\'s week of {submission.period_start}.')
@@ -8864,6 +9574,74 @@ def timesheet_bulk_decide(request):
     else:
         messages.info(request, 'No pending submissions matched.')
     return redirect('psa:timesheet_approval_queue')
+
+
+def _can_see_time_entry_history(user, entry, request):
+    is_staff = getattr(request, 'is_staff_user', False)
+    return user.is_superuser or is_staff or entry.user_id == user.pk
+
+
+@login_required
+@require_psa_enabled
+def time_entry_history(request, pk):
+    """Phase 25: one time entry's approval trail — submitted, approved or
+    rejected (by whom, when, with what note) and any change after approval.
+    Staff, superusers and the entry's own technician."""
+    from .models import TicketTimeEntry, TimeEntryAuditEvent
+    entry = TicketTimeEntry.objects.select_related('ticket', 'user', 'submission').filter(pk=pk).first()
+    events = TimeEntryAuditEvent.objects.filter(entry_ref=pk).select_related('actor', 'submission')
+    if entry is None:
+        # Deleted: the trail remains, for staff only.
+        if not (request.user.is_superuser or getattr(request, 'is_staff_user', False)) or not events.exists():
+            raise Http404
+    elif not _can_see_time_entry_history(request.user, entry, request):
+        raise Http404
+    locked = bool(entry and entry.submission_id and entry.submission.status == 'approved')
+    return render(request, 'psa/time_entry_history.html', {
+        'entry': entry, 'entry_ref': pk, 'events': events, 'locked': locked,
+        'can_correct': locked and request.user.is_superuser,
+    })
+
+
+@login_required
+@require_psa_enabled
+@require_http_methods(['POST'])
+def time_entry_correct(request, pk):
+    """Phase 25: a superuser changes an entry after its timesheet was
+    approved. A reason is required and the change is recorded field by
+    field on the entry's trail (and in the audit log)."""
+    from .models import TicketTimeEntry
+    if not request.user.is_superuser:
+        raise Http404
+    entry = get_object_or_404(TicketTimeEntry.objects.select_related('submission', 'ticket'), pk=pk)
+    back = redirect('psa:time_entry_history', pk=pk)
+    if not (entry.submission_id and entry.submission.status == 'approved'):
+        messages.info(request, 'This entry is not locked by an approved timesheet.')
+        return back
+    reason = (request.POST.get('reason') or '').strip()
+    if not reason:
+        messages.error(request, 'Give a reason for changing an approved entry.')
+        return back
+    try:
+        minutes = int(request.POST.get('duration_minutes') or entry.duration_minutes)
+        if minutes < 0:
+            raise ValueError
+    except ValueError:
+        messages.error(request, 'Minutes must be a whole number, zero or more.')
+        return back
+    entry.duration_minutes = minutes
+    entry.is_billable = (request.POST.get('is_billable') or '') in ('1', 'on', 'true')
+    entry.notes = (request.POST.get('notes') if 'notes' in request.POST else entry.notes) or ''
+    entry.save(_force_unlock=True, _audit_user=request.user, _audit_note=reason)
+    AuditLog.log(
+        user=request.user, action='update', organization=entry.ticket.organization,
+        object_type='psa.TicketTimeEntry', object_id=entry.pk,
+        object_repr=f'time entry {entry.pk} on {entry.ticket.ticket_number}',
+        description=f'Changed approved time entry {entry.pk}: {reason[:200]}',
+        ip_address=_client_ip(request), path=request.path,
+    )
+    messages.success(request, 'Entry changed; the change is on its approval trail.')
+    return back
 
 
 @login_required
@@ -9576,6 +10354,31 @@ def _my_work_approvals(request):
                 'url': reverse('psa:invoice_detail', args=[i.pk]),
             } for i in invoices[:5]],
         })
+
+    # RMM approvals (rmm_permissions.approvals): other technicians' requests
+    # this user qualifies to approve now. Only the customer, the kind of
+    # action and the requester are shown; the details stay on the page.
+    try:
+        from rmm_permissions import approvals as rmm_approvals
+        from rmm_permissions import catalog as rmm_catalog
+        from rmm_permissions.decision import is_technician
+        if request.user.is_superuser or is_technician(request.user):
+            waiting = [a for a in rmm_approvals.open_for(request.user).exclude(requester=request.user)[:50]
+                       if not rmm_approvals.refusal(a, request.user)]
+            if waiting:
+                rmm_url = reverse('rmm_permissions:approvals')
+                queues.append({
+                    'key': 'rmm', 'label': 'RMM approvals', 'icon': 'fa-user-shield',
+                    'count': len(waiting), 'url': rmm_url,
+                    'items': [{
+                        'title': (rmm_catalog.ACTIONS[a.action].label if a.action in rmm_catalog.ACTIONS
+                                  else a.action),
+                        'context': f'{a.organization.name} · asked by {a.requester.get_username()}',
+                        'when': a.created_at, 'url': rmm_url,
+                    } for a in waiting[:5]],
+                })
+    except Exception:  # noqa: BLE001 — a broken queue must not take My Work down
+        logger.debug('My Work: RMM approvals unavailable', exc_info=True)
     return queues
 
 
@@ -9663,8 +10466,14 @@ def my_work(request):
 
     approvals = _my_work_approvals(request) if staff else []
     appointments = _my_work_appointments(request.user)
+    # SLA risk, alerts, device health, maintenance, recent devices, remote
+    # sessions, jobs to review and (OPTIONAL AI) suggestions — MSP staff
+    # only, scoped to the technician's customers (core/workspace.py).
+    from core.workspace import my_work_panels
+    panels = my_work_panels(request, base, scope_all=scope_all)
 
     return render(request, 'psa/my_work.html', {
+        'panels': panels,
         'is_staff_view': staff,
         'scope_all': scope_all,
         'tab': tab,
@@ -10055,3 +10864,73 @@ def ticket_kb_draft(request, ticket_number):
     )
     messages.success(request, 'KB draft created. Edit it, then submit it for review — it is not published.')
     return redirect('docs:document_edit', slug=doc.slug)
+
+
+# ---------------------------------------------------------------------------
+# Phase 12 — two-way secure messages (requester replies)
+# ---------------------------------------------------------------------------
+
+@login_required
+@require_psa_enabled
+@require_http_methods(['POST'])
+def secure_reply_reveal(request, ticket_number, pk):
+    """Show one secure reply to a technician. POST-only, audit-logged, not cached."""
+    from .models import TicketSecureReply
+    if not is_msp_staff(request.user) and not request.user.is_superuser:
+        raise Http404
+    ticket = _scoped_ticket_for_write(request, ticket_number)
+    reply = get_object_or_404(TicketSecureReply, pk=pk, ticket=ticket)
+    content = None
+    if reply.state in ('unread', 'read'):
+        content = reply.get_body()
+        now = timezone.now()
+        fields = ['view_count']
+        reply.view_count += 1
+        if not reply.first_viewed_at:
+            reply.first_viewed_at, reply.first_viewed_by = now, request.user
+            fields += ['first_viewed_at', 'first_viewed_by']
+        reply.save(update_fields=fields)
+        AuditLog.log(
+            user=request.user, action='read', organization=ticket.organization,
+            object_type='psa.TicketSecureReply', object_id=reply.pk,
+            object_repr=f'secure reply on {ticket.ticket_number}',
+            description=f'Revealed a secure reply on {ticket.ticket_number}',
+            ip_address=_client_ip(request), path=request.path,
+            extra_data={'event': 'ticket_secure_reply_reveal', 'view': reply.view_count},
+        )
+    response = render(request, 'psa/secure_reply_reveal.html',
+                      {'ticket': ticket, 'reply': reply, 'content': content})
+    response['Cache-Control'] = 'no-store'
+    return response
+
+
+@require_http_methods(['POST'])
+def secure_reply_submit(request, token):
+    """The requester answers a secure message from its opened page.
+
+    No login: the reply token is signed, handed out only when the message is
+    opened, bound to that message's link and short-lived."""
+    from django_ratelimit.core import is_ratelimited
+    from .models import TicketSecureReply
+    from .ticket_secure import MAX_SECURE_LENGTH, comment_for_note, create_secure_reply, note_for_reply_token, replies_left
+    if is_ratelimited(request, group='psa.secure_reply', key='ip', rate='20/h', increment=True):
+        return render(request, 'psa/secure_reply_sent.html', {'error': 'Too many replies from here. Try again later.'},
+                      status=429)
+    note = note_for_reply_token(token)
+    comment = comment_for_note(note) if note else None
+    if comment is None:
+        return render(request, 'psa/secure_reply_sent.html',
+                      {'error': 'This reply link is no longer valid. Reply to the e-mail, or ask for a new secure message.'},
+                      status=410)
+    text = (request.POST.get('reply') or '').strip()
+    if not text or len(text) > MAX_SECURE_LENGTH:
+        return render(request, 'psa/secure_reply_sent.html',
+                      {'error': f'A secure reply must be between 1 and {MAX_SECURE_LENGTH} characters.'}, status=400)
+    if not replies_left(note):
+        return render(request, 'psa/secure_reply_sent.html',
+                      {'error': 'No more secure replies can be sent to this message.'}, status=410)
+    ticket = comment.ticket
+    create_secure_reply(ticket=ticket, text=text, via=TicketSecureReply.VIA_LINK,
+                        author=request.user, author_email=ticket.requester_email, in_reply_to=note,
+                        ip_address=_client_ip(request), path=request.path)
+    return render(request, 'psa/secure_reply_sent.html', {'ticket_number': ticket.ticket_number})

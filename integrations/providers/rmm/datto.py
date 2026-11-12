@@ -126,7 +126,8 @@ class DattoRMMProvider(BaseRMMProvider):
             Normalized device dictionary
         """
         try:
-            response = self._make_request('GET', f'/api/v2/account/devices/{device_id}')
+            # Datto RMM API v2: GET /v2/device/{deviceUid}.
+            response = self._make_request('GET', f'/api/v2/device/{device_id}')
             return self.normalize_device(response.json())
         except Exception as e:
             logger.error(f"Error getting Datto device {device_id}: {e}")
@@ -174,12 +175,9 @@ class DattoRMMProvider(BaseRMMProvider):
         software_list = []
 
         try:
-            response = self._make_request('GET', f'/api/v2/account/devices/{device_id}/software')
-            data = response.json()
-
-            software_data = data.get('software', [])
-
-            for sw_data in software_data:
+            # Datto RMM API v2: GET /v2/audit/device/{deviceUid}/software,
+            # paged like the other lists; items carry name and version.
+            for sw_data in self._paged(f'/api/v2/audit/device/{device_id}/software', 'software'):
                 try:
                     software_list.append(self.normalize_software(sw_data))
                 except Exception as e:
@@ -190,7 +188,9 @@ class DattoRMMProvider(BaseRMMProvider):
 
         except Exception as e:
             logger.error(f"Error listing Datto RMM software for device {device_id}: {e}")
-            return software_list
+            # Raise so the sync keeps this device\'s stored software
+            # instead of reading the failure as "nothing installed".
+            raise ProviderError(f"Failed to list software: {e}")
 
     def normalize_device(self, raw_data: Dict[str, Any]) -> Dict[str, Any]:
         """

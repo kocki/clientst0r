@@ -42,12 +42,14 @@ LEGACY_SNAPSHOT_TOLERANCE = timedelta(seconds=2)
 # have been dealt with. Organizations are always handled last, separately.
 DELETE_ORDER = [
     'LocationFloorPlan', 'FloorPlan', 'VehicleInventoryItem', 'ShopInventoryItem',
+    'IPAddress', 'Subnet', 'WebsiteMonitor',
     'Password', 'Document', 'Contact', 'Asset', 'Location',
 ]
 
 # Rows that point at a record/organization but are not "data" that should keep
 # it alive: the audit trail (SET_NULL - history survives deletion, unlinked).
-IGNORED_REFERENCE_MODELS = {('audit', 'auditlog')}
+# Serial lifecycle events are history (they keep the asset's name), not a use.
+IGNORED_REFERENCE_MODELS = {('audit', 'auditlog'), ('assets', 'serialevent')}
 
 
 def _label(model):

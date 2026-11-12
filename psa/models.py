@@ -24,9 +24,8 @@ from vault.secret_fields import EncryptedTextField, SealedTextField
 
 class ClientPSASettings(models.Model):
     """
-    Per-org PSA configuration. PSA is off by default for every client; an
-    admin must explicitly enable it. Additional client-level toggles guard
-    the more sensitive surfaces (portal, anonymous tickets, ingestion).
+    Per-org PSA configuration: the native PSA opt-out (`enabled`) and the
+    customer portal switch (`portal_enabled`, off by default).
     """
     organization = models.OneToOneField(
         'core.Organization',
@@ -40,13 +39,13 @@ class ClientPSASettings(models.Model):
                   'use this to opt a specific client OUT.',
     )
 
-    # Surface flags — every external surface defaults to OFF.
+    # The customer portal is off until switched on for this customer.
+    # (Five other per-customer switches — anonymous form, email-to-ticket,
+    # SMS, desktop alerts, external ingest — were saved but never read and
+    # were removed in psa 0083: email-to-ticket follows each mailbox, SMS
+    # follows Settings -> SMS and each technician, and there is no anonymous
+    # form, desktop channel or ingest gate.)
     portal_enabled = models.BooleanField(default=False, help_text='Allow this client to use the customer portal')
-    anonymous_ticket_form_enabled = models.BooleanField(default=False, help_text='Allow public/anonymous ticket submission')
-    email_to_ticket_enabled = models.BooleanField(default=False, help_text='Convert inbound emails to tickets')
-    sms_notifications_enabled = models.BooleanField(default=False, help_text='Send SMS to staff for this client (no secrets)')
-    desktop_alerts_enabled = models.BooleanField(default=False, help_text='Send desktop/browser alerts to staff for this client')
-    external_alert_ingest_enabled = models.BooleanField(default=False, help_text='Accept alerts from external monitoring/RMM for this client')
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -275,6 +274,19 @@ class Ticket(models.Model):
         null=True, blank=True, related_name='generated_tickets',
         help_text='Set when the ticket was created by a recurring schedule',
     )
+    # Phase 60.6 — the customer's site (locations.Location) the ticket is
+    # about. Optional; filled at intake when it can be worked out (see
+    # psa/ticket_site.py) and editable on the ticket. Routing rules can match
+    # on it and dispatch measures travel to it; neither changes it.
+    site = models.ForeignKey(
+        'locations.Location', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='psa_tickets',
+        help_text="The customer's site this ticket is about",
+    )
+    site_source = models.CharField(
+        max_length=20, blank=True, default='',
+        help_text='How the site was set: manual, asset, contact, requester or only_site',
+    )
 
     # Severity scoring
     # Phase 40.4 (v3.17.542) — status-page incidents. The flag marks a ticket
@@ -403,6 +415,13 @@ class Ticket(models.Model):
     def save(self, *args, **kwargs):
         if not self.ticket_number:
             self.ticket_number = self._generate_ticket_number()
+        if self.pk is None:
+            try:
+                from psa.ticket_site import fill_on_create
+                fill_on_create(self)
+            except Exception:  # noqa: BLE001 — a site lookup never blocks intake
+                import logging
+                logging.getLogger('psa.ticket_site').exception('site inference failed')
         super().save(*args, **kwargs)
 
     @property
@@ -585,6 +604,41 @@ class Ticket(models.Model):
 # ---------------------------------------------------------------------------
 # Ticket comments / notes / attachments
 # ---------------------------------------------------------------------------
+
+class RequesterDefaultSite(models.Model):
+    """Phase 60.6 — the site a requester usually raises tickets from, at one
+    customer. Either a contact or a portal user, never both. Read at intake
+    (psa/ticket_site.py) and written when a technician sets a ticket's site
+    and ticks "remember for this requester". Staff-only."""
+    organization = models.ForeignKey('core.Organization', on_delete=models.CASCADE,
+                                     related_name='psa_requester_sites')
+    location = models.ForeignKey('locations.Location', on_delete=models.CASCADE,
+                                 related_name='psa_requester_defaults')
+    contact = models.ForeignKey('assets.Contact', on_delete=models.CASCADE, null=True, blank=True,
+                                related_name='psa_default_sites')
+    user = models.ForeignKey(django_settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+                             null=True, blank=True, related_name='psa_default_sites')
+    updated_by = models.ForeignKey(django_settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+                                   null=True, blank=True, related_name='+')
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'psa_requester_default_sites'
+        constraints = [
+            models.UniqueConstraint(fields=['organization', 'contact'], condition=models.Q(contact__isnull=False),
+                                    name='uniq_psa_default_site_contact'),
+            models.UniqueConstraint(fields=['organization', 'user'], condition=models.Q(user__isnull=False),
+                                    name='uniq_psa_default_site_user'),
+            models.CheckConstraint(
+                condition=(models.Q(contact__isnull=False, user__isnull=True)
+                           | models.Q(contact__isnull=True, user__isnull=False)),
+                name='psa_default_site_contact_xor_user'),
+        ]
+
+    def __str__(self):
+        who = self.contact or self.user
+        return f'{who} @ {self.location}'
+
 
 class TicketComment(models.Model):
     """
@@ -781,6 +835,69 @@ class CannedReply(models.Model):
 # Phase 2c — time tracking + service catalog + hygiene
 # ---------------------------------------------------------------------------
 
+class TicketSecureReply(models.Model):
+    """Phase 12: the requester's half of a secure message thread.
+
+    Staff send sealed one-time messages with a reply (`TicketComment.secure_note`,
+    v3.17.654). The requester answers from that message's page (a signed,
+    short-lived reply token handed out only when the message is opened) or
+    from the customer portal. The text is sealed at rest, never put in an
+    e-mail or notification, shown to staff only behind a logged Reveal, and
+    erased when `expires_at` passes (`manage.py psa_purge_secure_replies`).
+    """
+    VIA_LINK = 'link'
+    VIA_PORTAL = 'portal'
+    VIA_CHOICES = [(VIA_LINK, 'Secure message link'), (VIA_PORTAL, 'Customer portal')]
+
+    ticket = models.ForeignKey(Ticket, on_delete=models.CASCADE, related_name='secure_replies')
+    organization = models.ForeignKey('core.Organization', on_delete=models.CASCADE,
+                                     related_name='psa_secure_replies')
+    in_reply_to = models.ForeignKey('core.SecureNote', on_delete=models.SET_NULL, null=True, blank=True,
+                                    related_name='ticket_replies',
+                                    help_text='The secure message this answers, when sent from its link.')
+    body = SealedTextField(blank=True)
+    author = models.ForeignKey(django_settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+                               null=True, blank=True, related_name='+')
+    author_email = models.EmailField(blank=True)
+    via = models.CharField(max_length=10, choices=VIA_CHOICES)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField(help_text='The text is erased after this.')
+    first_viewed_at = models.DateTimeField(null=True, blank=True)
+    first_viewed_by = models.ForeignKey(django_settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+                                        null=True, blank=True, related_name='+')
+    view_count = models.PositiveIntegerField(default=0)
+    purged_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = 'psa_ticket_secure_replies'
+        ordering = ['created_at', 'pk']
+        indexes = [models.Index(fields=['ticket', 'created_at']),
+                   models.Index(fields=['expires_at'])]
+
+    def __str__(self):
+        return f'secure reply {self.pk} on {self.ticket_id}'
+
+    def set_body(self, text):
+        self.body = self._meta.get_field('body').seal(text) if text else ''
+
+    def get_body(self):
+        if not self.body:
+            return ''
+        return self._meta.get_field('body').unseal_text(self.body)
+
+    @property
+    def is_expired(self):
+        return self.expires_at is not None and timezone.now() >= self.expires_at
+
+    @property
+    def state(self):
+        if self.purged_at or not self.body:
+            return 'erased'
+        if self.is_expired:
+            return 'expired'
+        return 'read' if self.view_count else 'unread'
+
+
 class TicketTimeEntry(models.Model):
     """
     Time logged against a ticket. Supports running-timer entries
@@ -830,6 +947,16 @@ class TicketTimeEntry(models.Model):
         null=True, blank=True, related_name='entries',
         help_text='Weekly batch this entry belongs to. Null = unsubmitted.',
     )
+    # Phase 25: an approver can send one entry back while approving the rest
+    # of the week. The entry leaves the submission (so it is not locked and
+    # not counted as approved) and carries the reason until it is resubmitted.
+    rejection_reason = models.TextField(
+        blank=True, default='',
+        help_text='Why an approver returned this entry. Cleared on resubmit.')
+    rejected_at = models.DateTimeField(null=True, blank=True)
+    rejected_by = models.ForeignKey(
+        django_settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='+')
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -857,11 +984,14 @@ class TicketTimeEntry(models.Model):
     def save(self, *args, **kwargs):
         is_new = self.pk is None
         prior_scope = None
+        # Phase 25 audit trail: who is saving, and why, when the entry is
+        # already approved. Both optional; popped so Model.save() never sees them.
+        audit_user = kwargs.pop('_audit_user', None)
+        audit_note = kwargs.pop('_audit_note', '')
+        force_unlock = kwargs.pop('_force_unlock', False)
+        approved_prior = None
         if not is_new:
-            prior = TicketTimeEntry.objects.filter(pk=self.pk).only(
-                'duration_minutes', 'ended_at', 'submission_id',
-                'ticket_id', 'started_at',
-            ).first()
+            prior = TicketTimeEntry.objects.filter(pk=self.pk).first()
             if prior:
                 # Where the entry counted before this save, so an edit that
                 # moves it (other ticket/client, other date) also corrects
@@ -870,22 +1000,33 @@ class TicketTimeEntry(models.Model):
                 # Phase 25 v2 (v3.17.249): lock entries attached to an
                 # approved TimesheetSubmission. Caller can pass
                 # `_force_unlock=True` for admin overrides; otherwise the
-                # save is silently a no-op via early return.
-                if (prior.submission_id
-                        and not kwargs.pop('_force_unlock', False)):
-                    try:
-                        sub = TimesheetSubmission.objects.only('status').get(
-                            pk=prior.submission_id,
-                        )
-                        if sub.status == 'approved':
+                # save is a no-op via early return (now recorded).
+                if prior.submission_id:
+                    sub = TimesheetSubmission.objects.filter(
+                        pk=prior.submission_id).only('status').first()
+                    if sub is not None and sub.status == 'approved':
+                        changes = TimeEntryAuditEvent.diff(prior, self)
+                        if not force_unlock:
+                            if changes:
+                                TimeEntryAuditEvent.objects.create(
+                                    entry_id=self.pk, entry_ref=self.pk, submission=sub,
+                                    action='edit_refused', actor=audit_user,
+                                    note=(audit_note or '')[:5000], changes=changes)
                             return
-                    except Exception:
-                        pass
+                        approved_prior = (sub, changes)
 
         if self.ended_at and self.started_at and not self.duration_minutes:
             delta = self.ended_at - self.started_at
             self.duration_minutes = max(0, int(delta.total_seconds() // 60))
         super().save(*args, **kwargs)
+
+        if approved_prior is not None:
+            sub, changes = approved_prior
+            if changes:
+                TimeEntryAuditEvent.objects.create(
+                    entry_id=self.pk, entry_ref=self.pk, submission=sub,
+                    action='changed_after_approval', actor=audit_user,
+                    note=(audit_note or '')[:5000], changes=changes)
 
         # Contract hour accounting (v3.17.600). This used to add
         # `duration_minutes` to the active contract's `hours_used_minutes` on
@@ -2118,11 +2259,12 @@ class Contract(models.Model):
         period. If `recurring_amount` is set explicitly, use that;
         otherwise fall back to `total_hours * hourly_rate` for
         retainer/managed-services contracts."""
-        from decimal import Decimal as _D
+        from decimal import Decimal as _D, ROUND_HALF_UP
         if self.recurring_amount and self.recurring_amount > 0:
             return _D(str(self.recurring_amount))
         if self.total_hours and self.hourly_rate:
-            return (_D(str(self.total_hours)) * _D(str(self.hourly_rate))).quantize(_D('0.01'))
+            return (_D(str(self.total_hours)) * _D(str(self.hourly_rate))).quantize(
+                _D('0.01'), rounding=ROUND_HALF_UP)
         return _D('0')
 
     @staticmethod
@@ -2193,7 +2335,7 @@ class Contract(models.Model):
         for meters.
         """
         from datetime import date as _d
-        from decimal import Decimal as _D
+        from decimal import Decimal as _D, ROUND_HALF_UP
         if self.billing_frequency == 'none':
             return None
         on_date = on_date or _d.today()
@@ -2233,7 +2375,8 @@ class Contract(models.Model):
 
         # Phase 15 v4: prorate the base amount when applicable
         proration = self._proration_factor(on_date, self.billing_frequency)
-        prorated_amount = (_D(str(amount)) * _D(str(proration))).quantize(_D('0.01'))
+        prorated_amount = (_D(str(amount)) * _D(str(proration))).quantize(
+            _D('0.01'), rounding=ROUND_HALF_UP)
 
         inv = Invoice.objects.create(
             organization=self.organization,
@@ -2790,6 +2933,10 @@ class EmailIngestionConfig(models.Model):
 # Quotes / Estimates (Workstream 5 — sales pipeline)
 # ---------------------------------------------------------------------------
 
+class SignedQuoteLocked(ValueError):
+    """An edit would change the content of a quote the customer signed."""
+
+
 class Quote(models.Model):
     """
     Sales quote / estimate. Goes through draft → sent → accepted/rejected,
@@ -2876,7 +3023,72 @@ class Quote(models.Model):
             if kwargs.get('update_fields') is not None:
                 kwargs['update_fields'] = (set(kwargs['update_fields'])
                                            | {'customer_token', 'customer_token_hash'})
+        if self.pk:
+            self._refuse_signed_content_change()
         super().save(*args, **kwargs)
+
+    # --- signed-revision binding ------------------------------------------
+    # A signature records the hash of exactly what was signed (number,
+    # title, description, validity, client, tax rate, lines, totals). Once
+    # a quote carries such a signature its content cannot change: status,
+    # conversion and approval bookkeeping still save, anything else raises
+    # SignedQuoteLocked. Signatures from before this binding have no hash
+    # and lock nothing.
+
+    CONTENT_SCHEMA = 'clientst0r.quote-content.v1'
+
+    def content_snapshot(self, line_items=None) -> dict:
+        from decimal import Decimal
+
+        def money(v, places=2):
+            return f'{Decimal(str(v if v is not None else 0)):.{places}f}'
+
+        lines = line_items if line_items is not None else (
+            list(self.line_items.order_by('sort_order', 'pk')) if self.pk else [])
+        return {
+            'schema': self.CONTENT_SCHEMA,
+            'quote_number': self.quote_number or '',
+            'title': self.title or '',
+            'description': self.description or '',
+            'valid_until': self.valid_until.isoformat() if self.valid_until else '',
+            'client': {'id': self.client_org_id, 'name': getattr(self.client_org, 'name', '')},
+            'tax_rate': money(self.tax_rate, 4),
+            'subtotal': money(self.subtotal),
+            'tax_amount': money(self.tax_amount),
+            'total': money(self.total),
+            'lines': [{'sort_order': li.sort_order, 'description': li.description,
+                       'quantity': money(li.quantity), 'unit_price': money(li.unit_price),
+                       'is_taxable': bool(li.is_taxable), 'line_total': money(li.line_total)}
+                      for li in lines],
+        }
+
+    def content_json(self, line_items=None) -> bytes:
+        import json as _json
+        return _json.dumps(self.content_snapshot(line_items), sort_keys=True, ensure_ascii=False,
+                           separators=(',', ':')).encode('utf-8')
+
+    def content_hash(self, line_items=None) -> str:
+        import hashlib
+        return hashlib.sha256(self.content_json(line_items)).hexdigest()
+
+    def signed_content_hash(self) -> str:
+        """The content hash the quote's signature is bound to ('' if unsigned
+        or signed before binding)."""
+        if not self.pk:
+            return ''
+        return (QuoteSignature.objects.filter(quote_id=self.pk).values_list('content_hash', flat=True)
+                .first() or '')
+
+    @property
+    def is_signature_locked(self) -> bool:
+        return bool(self.signed_content_hash())
+
+    def _refuse_signed_content_change(self):
+        bound = self.signed_content_hash()
+        if bound and self.content_hash() != bound:
+            raise SignedQuoteLocked(
+                f'Quote {self.quote_number} was signed; its content cannot change. '
+                f'Create a new quote instead.')
 
     CUSTOMER_TOKEN_PURPOSE = 'psa.quote.sign'
 
@@ -3063,15 +3275,31 @@ class QuoteLineItem(models.Model):
         db_table = 'psa_quote_line_items'
         ordering = ['sort_order', 'pk']
 
+    def _refuse_if_signed(self):
+        if self.quote_id and QuoteSignature.objects.filter(quote_id=self.quote_id).exclude(
+                content_hash='').exists():
+            raise SignedQuoteLocked('This quote was signed; its lines cannot change. Create a new quote instead.')
+
+    def save(self, *args, **kwargs):
+        self._refuse_if_signed()
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        self._refuse_if_signed()
+        return super().delete(*args, **kwargs)
+
     @property
     def line_total(self):
-        from decimal import Decimal, InvalidOperation
+        from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
         try:
             q = Decimal(str(self.quantity or '0'))
             p = Decimal(str(self.unit_price or '0'))
         except (InvalidOperation, ValueError, TypeError):
             return Decimal('0.00')
-        return (q * p).quantize(Decimal('0.01'))
+        # Half-up, like the tax (v3.17.561) and like the accounting
+        # providers. Decimal's default is banker's rounding, which put a
+        # 0.25 h x 10.10 line at 2.52 here and 2.53 in QuickBooks / Xero.
+        return (q * p).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
     def __str__(self):
         return f'{self.description} ({self.quantity} × {self.unit_price})'
@@ -3140,11 +3368,16 @@ class TimesheetSubmission(models.Model):
         blank=True,
         help_text='Optional comment from the tech when submitting.',
     )
+    # 1 for the week's first submission. When entries are returned from an
+    # approved week, fixing and resubmitting them opens revision 2 (and so on)
+    # for the same week: the approved revision and its locked entries stay
+    # exactly as they were approved.
+    revision = models.PositiveSmallIntegerField(default=1)
 
     class Meta:
         db_table = 'psa_timesheet_submissions'
         ordering = ['-period_start', '-submitted_at']
-        unique_together = [['user', 'period_start', 'period_end']]
+        unique_together = [['user', 'period_start', 'period_end', 'revision']]
         indexes = [
             models.Index(fields=['user', '-period_start']),
             models.Index(fields=['status', '-submitted_at']),
@@ -3168,6 +3401,9 @@ class TimesheetSubmission(models.Model):
         self.decided_at = timezone.now()
         self.decision_notes = (notes or '')[:5000]
         self.save(update_fields=['status', 'decided_by', 'decided_at', 'decision_notes'])
+        TimeEntryAuditEvent.record_for_entries(
+            self.entries.all(), action='approved', actor=user, submission=self,
+            note=self.decision_notes)
 
     def reject(self, *, user, notes=''):
         self.status = 'rejected'
@@ -3175,8 +3411,123 @@ class TimesheetSubmission(models.Model):
         self.decided_at = timezone.now()
         self.decision_notes = (notes or '')[:5000]
         self.save(update_fields=['status', 'decided_by', 'decided_at', 'decision_notes'])
+        # Recorded per entry before they are detached, so each entry keeps
+        # who rejected it, when and why after it leaves the submission.
+        TimeEntryAuditEvent.record_for_entries(
+            self.entries.all(), action='rejected', actor=user, submission=self,
+            note=self.decision_notes)
         # Detach entries so the tech can re-submit after fixes.
         self.entries.update(submission=None)
+
+    def return_entries(self, reasons, *, user):
+        """Send individual entries back to the technician with a reason each.
+
+        `reasons` maps entry id -> reason. Only entries in this (pending)
+        submission are touched. Each returned entry gets a 'rejected' event on
+        its trail, is detached from the submission and carries the reason for
+        the technician; the remaining entries are left for approve().
+        Returns the number of entries returned.
+        """
+        now = timezone.now()
+        returned = 0
+        for entry in self.entries.filter(pk__in=list(reasons)):
+            reason = (reasons.get(entry.pk) or '').strip()[:5000]
+            TimeEntryAuditEvent.objects.create(
+                entry_id=entry.pk, entry_ref=entry.pk, submission=self,
+                action='rejected', actor=user, note=reason)
+            TicketTimeEntry.objects.filter(pk=entry.pk).update(
+                submission=None, rejection_reason=reason,
+                rejected_at=now, rejected_by=user)
+            returned += 1
+        return returned
+
+    def decide_with_returns(self, reasons, *, user, notes=''):
+        """Return the entries in `reasons` and approve everything else.
+
+        If nothing would be left to approve the submission is rejected
+        instead (the per-entry reasons are already on each entry).
+        Returns 'approved' or 'rejected'.
+        """
+        self.return_entries(reasons, user=user)
+        if self.entries.exists():
+            self.approve(user=user, notes=notes)
+            return 'approved'
+        self.reject(user=user, notes=notes)
+        return 'rejected'
+
+
+class TimeEntryAuditEvent(models.Model):
+    """Phase 25: the approval history of one time entry.
+
+    One row per entry per event — submitted, approved, rejected, and any
+    change or delete made after approval (which the lock in
+    `TicketTimeEntry.save()` otherwise only allows through `_force_unlock`).
+    An edit the lock refused is recorded too, so a change that silently did
+    not happen is visible. Rows outlive the entry: `entry_ref` keeps its id.
+    """
+    ACTION_CHOICES = [
+        ('submitted', 'Submitted for approval'),
+        ('approved', 'Approved'),
+        ('rejected', 'Rejected'),
+        ('changed_after_approval', 'Changed after approval'),
+        ('edit_refused', 'Edit refused (entry locked by approval)'),
+        ('deleted_after_approval', 'Deleted after approval'),
+    ]
+    # Fields whose change after approval is worth recording.
+    TRACKED_FIELDS = ('ticket_id', 'started_at', 'ended_at', 'duration_minutes',
+                      'is_billable', 'role_code', 'notes')
+
+    entry = models.ForeignKey(
+        'psa.TicketTimeEntry', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='audit_events')
+    entry_ref = models.PositiveIntegerField(
+        db_index=True, help_text='Time entry id, kept after the entry is deleted.')
+    submission = models.ForeignKey(
+        TimesheetSubmission, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='entry_events')
+    action = models.CharField(max_length=30, choices=ACTION_CHOICES)
+    actor = models.ForeignKey(
+        django_settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='+')
+    note = models.TextField(blank=True)
+    changes = models.JSONField(
+        default=dict, blank=True,
+        help_text='{field: [before, after]} for changes after approval.')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'psa_time_entry_audit_events'
+        ordering = ['created_at', 'pk']
+        indexes = [models.Index(fields=['entry_ref', 'created_at'])]
+
+    def __str__(self):
+        return f'entry {self.entry_ref}: {self.action}'
+
+    @classmethod
+    def record_for_entries(cls, entries, *, action, actor=None, submission=None, note=''):
+        rows = [cls(entry_id=e.pk, entry_ref=e.pk, submission=submission, action=action,
+                    actor=actor, note=(note or '')[:5000]) for e in entries]
+        if rows:
+            cls.objects.bulk_create(rows)
+        return len(rows)
+
+    @classmethod
+    def diff(cls, before, after):
+        """{field: [before, after]} over TRACKED_FIELDS, JSON-safe."""
+        out = {}
+        for f in cls.TRACKED_FIELDS:
+            a, b = getattr(before, f, None), getattr(after, f, None)
+            if a != b:
+                out[f] = [_audit_value(a), _audit_value(b)]
+        return out
+
+
+def _audit_value(v):
+    if v is None or isinstance(v, (bool, int, str)):
+        return v
+    if hasattr(v, 'isoformat'):
+        return v.isoformat()
+    return str(v)
 
 
 class TicketCSATSurvey(models.Model):
@@ -4149,47 +4500,92 @@ class Invoice(models.Model):
           - The new memo's invoice_number uses a `CN-YYYY-NNNNN` prefix
             so credit memos sort separately from regular invoices.
         """
-        from decimal import Decimal as _D
+        from decimal import Decimal as _D, InvalidOperation, ROUND_HALF_UP
         if self.is_credit_memo:
             raise ValueError('Cannot issue a credit memo against another credit memo.')
-
-        memo = Invoice(
-            organization=self.organization,
-            client_org=self.client_org,
-            title=f'Credit Memo for {self.invoice_number}',
-            description=(reason or '')[:500],
-            status='draft',
-            invoice_date=timezone.now().date(),
-            currency=self.currency,
-            tax_rate=self.tax_rate,
-            is_credit_memo=True,
-            credits_invoice=self,
-            created_by=user,
-        )
-        # Override _next_number prefix via direct assign before save
-        memo.invoice_number = self._next_credit_memo_number()
-        memo.save()
-
         if amount is not None:
-            InvoiceLineItem.objects.create(
-                invoice=memo,
-                description=(reason or f'Credit memo against {self.invoice_number}')[:300],
-                quantity=1,
-                unit_price=-_D(str(amount)),
-                is_taxable=False,
-                source='manual',
+            try:
+                amount = _D(str(amount)).quantize(_D('0.01'), rounding=ROUND_HALF_UP)
+            except (InvalidOperation, ValueError, TypeError):
+                raise ValueError('The credit amount is not a number.')
+            if amount <= 0:
+                raise ValueError('The credit amount must be more than zero.')
+
+        with transaction.atomic():
+            # Locked so two clicks (or two staff) cannot both pass the checks
+            # below against the same, not-yet-credited invoice.
+            source = Invoice.objects.select_for_update().get(pk=self.pk)
+            if source.status == 'void':
+                raise ValueError(f'{source.invoice_number} is void; there is nothing to credit.')
+            if amount is None:
+                # A full credit copies every line. A second one — a double
+                # click, or a full credit after a partial one — credited the
+                # same lines again, and the client's balance went negative by
+                # a whole invoice. Partial credits by amount stay allowed past
+                # the total: that is account credit, by design (v3.17.578).
+                already = source.credited_amount
+                if already > 0:
+                    remaining = max(_D('0.00'), _D(str(source.total or 0)) - already)
+                    raise ValueError(
+                        f'{source.invoice_number} already has {already} credited. '
+                        f'A full credit would credit those lines again; credit the '
+                        f'remaining {remaining} as an amount instead.')
+                if _D(str(source.total or 0)) <= 0:
+                    raise ValueError(f'{source.invoice_number} has no positive total to credit.')
+
+            memo = Invoice(
+                organization=self.organization,
+                client_org=self.client_org,
+                title=f'Credit Memo for {self.invoice_number}',
+                description=(reason or '')[:500],
+                status='draft',
+                invoice_date=timezone.now().date(),
+                currency=self.currency,
+                tax_rate=self.tax_rate,
+                is_credit_memo=True,
+                credits_invoice=self,
+                created_by=user,
             )
-        else:
-            for li in self.line_items.all():
+            # CN- numbers are assigned here, so Invoice.save()'s retry on a
+            # duplicate number never ran for credit memos: two memos raised at
+            # once could pick the same number and the loser failed with a raw
+            # IntegrityError. Same savepoint retry as invoices.
+            last_error = None
+            for _attempt in range(5):
+                memo.invoice_number = self._next_credit_memo_number()
+                try:
+                    with transaction.atomic():
+                        memo.save()
+                    last_error = None
+                    break
+                except IntegrityError as exc:
+                    if 'invoice_number' not in str(exc).lower():
+                        raise
+                    last_error = exc
+                    memo.pk = None
+            if last_error is not None:
+                raise last_error
+
+            if amount is not None:
                 InvoiceLineItem.objects.create(
                     invoice=memo,
-                    description=f'Credit: {li.description}'[:300],
-                    quantity=li.quantity,
-                    unit_price=-li.unit_price,
-                    is_taxable=li.is_taxable,
+                    description=(reason or f'Credit memo against {self.invoice_number}')[:300],
+                    quantity=1,
+                    unit_price=-amount,
+                    is_taxable=False,
                     source='manual',
                 )
-        memo.recompute_totals()
+            else:
+                for li in self.line_items.all():
+                    InvoiceLineItem.objects.create(
+                        invoice=memo,
+                        description=f'Credit: {li.description}'[:300],
+                        quantity=li.quantity,
+                        unit_price=-li.unit_price,
+                        is_taxable=li.is_taxable,
+                        source='manual',
+                    )
+            memo.recompute_totals()
         return memo
 
     @classmethod
@@ -4268,13 +4664,16 @@ class InvoiceLineItem(models.Model):
 
     @property
     def line_total(self):
-        from decimal import Decimal, InvalidOperation
+        from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
         try:
             q = Decimal(str(self.quantity or '0'))
             p = Decimal(str(self.unit_price or '0'))
         except (InvalidOperation, ValueError, TypeError):
             return Decimal('0.00')
-        return (q * p).quantize(Decimal('0.01'))
+        # Half-up, like the tax (v3.17.561) and like the accounting
+        # providers. Decimal's default is banker's rounding, which put a
+        # 0.25 h x 10.10 line at 2.52 here and 2.53 in QuickBooks / Xero.
+        return (q * p).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
     def __str__(self):
         return f'{self.description} ({self.quantity} × {self.unit_price})'
@@ -4377,11 +4776,70 @@ class QuoteSignature(models.Model):
     ip_address = models.GenericIPAddressField(null=True, blank=True)
     user_agent = models.CharField(max_length=400, blank=True)
 
+    # Binding to the exact revision signed. Empty on signatures made before
+    # this was recorded (they show as "not bound" and lock nothing).
+    content_hash = models.CharField(max_length=64, blank=True,
+        help_text='SHA-256 of content_json: the quote exactly as signed')
+    content_json = models.TextField(blank=True,
+        help_text='Canonical JSON of the quote as signed (number, client, lines, tax, totals)')
+    pdf = models.BinaryField(null=True, blank=True, help_text='The quote PDF as the customer saw it')
+    pdf_hash = models.CharField(max_length=64, blank=True)
+    evidence_hash = models.CharField(max_length=64, blank=True,
+        help_text='SHA-256 of evidence.json')
+
     class Meta:
         db_table = 'psa_quote_signatures'
 
     def __str__(self):
         return f'Signed by {self.signed_by_name} at {self.signed_at:%Y-%m-%d %H:%M}'
+
+    @property
+    def is_bound(self) -> bool:
+        return bool(self.content_hash)
+
+    def evidence(self) -> dict:
+        import hashlib
+        q = self.quote
+        return {
+            'schema': 'clientst0r.quote-signature-evidence.v1',
+            'quote': {'id': q.pk, 'number': q.quote_number, 'content_hash': self.content_hash,
+                      'pdf_hash': self.pdf_hash},
+            'signer': {'name': self.signed_by_name, 'email': self.signed_by_email,
+                       'title': self.signed_by_title,
+                       'signature_sha256': hashlib.sha256(self.signature_data.encode('utf-8')).hexdigest()
+                       if self.signature_data else ''},
+            'signed_at': self.signed_at.isoformat() if self.signed_at else '',
+            'ip_address': self.ip_address or '',
+            'user_agent': self.user_agent,
+        }
+
+    def evidence_json(self) -> bytes:
+        import json as _json
+        return _json.dumps(self.evidence(), sort_keys=True, ensure_ascii=False,
+                           separators=(',', ':')).encode('utf-8')
+
+    def verify(self) -> dict:
+        """Each stored hash recomputed, plus whether the quote still has the
+        content that was signed (`current`)."""
+        import hashlib
+
+        def h(b):
+            return hashlib.sha256(b or b'').hexdigest()
+        if not self.is_bound:
+            return {}
+        return {'content': h(self.content_json.encode('utf-8')) == self.content_hash,
+                'pdf': (not self.pdf_hash) or h(bytes(self.pdf or b'')) == self.pdf_hash,
+                'evidence': h(self.evidence_json()) == self.evidence_hash,
+                'current': self.quote.content_hash() == self.content_hash}
+
+    def save(self, *args, **kwargs):
+        if self.pk and QuoteSignature.objects.filter(pk=self.pk).exclude(content_hash='').exists():
+            raise SignedQuoteLocked('A bound quote signature cannot be changed.')
+        super().save(*args, **kwargs)
+        if self.content_hash and not self.evidence_hash:
+            import hashlib
+            self.evidence_hash = hashlib.sha256(self.evidence_json()).hexdigest()
+            QuoteSignature.objects.filter(pk=self.pk).update(evidence_hash=self.evidence_hash)
 
 
 # ---------------------------------------------------------------------------
@@ -6677,3 +7135,37 @@ class TicketPresence(models.Model):
         if exclude_user is not None:
             qs = qs.exclude(user=exclude_user)
         return qs.order_by('user__username')
+
+
+# ---------------------------------------------------------------------------
+# Affected devices (ClientSt0r ↔ RMM Phase 4). A ticket's own `related_asset`
+# stays its primary device; these rows add the other devices the same
+# problem touches. Always the ticket's own customer: `save()` refuses an
+# asset from anywhere else, and every reader filters on the organization
+# again (psa/affected.py).
+# ---------------------------------------------------------------------------
+
+class TicketAffectedAsset(models.Model):
+    ticket = models.ForeignKey(Ticket, on_delete=models.CASCADE, related_name='affected_asset_links')
+    asset = models.ForeignKey('assets.Asset', on_delete=models.CASCADE, related_name='affected_ticket_links')
+    organization = models.ForeignKey('core.Organization', on_delete=models.CASCADE, related_name='+')
+    added_by = models.ForeignKey(django_settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True,
+                                 blank=True, related_name='+')
+    added_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'psa_ticket_affected_assets'
+        ordering = ['added_at', 'pk']
+        constraints = [
+            models.UniqueConstraint(fields=['ticket', 'asset'], name='psa_ticket_affected_asset_once'),
+        ]
+        indexes = [models.Index(fields=['asset', 'organization'])]
+
+    def save(self, *args, **kwargs):
+        if self.ticket.organization_id != self.asset.organization_id:
+            raise ValueError('An affected device must belong to the ticket\'s own customer.')
+        self.organization_id = self.ticket.organization_id
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f'{self.ticket_id} affects asset {self.asset_id}'

@@ -51,8 +51,22 @@ def _expiry(value):
     return dt
 
 
-def _caps_from_post(post):
-    return catalog.clean_capabilities({k: post.get(f'cap_{k}', catalog.OFF) for k in catalog.OPTIONAL})
+def _caps_from_post(post, current):
+    """The posted capability map. A capability the POST does not carry keeps
+    its current state: a partial submission is not a request to switch
+    everything it left out to Off. Each select always posts its value, so
+    choosing Off still posts `off`."""
+    current = catalog.clean_capabilities(current)
+    return catalog.clean_capabilities({k: post.get(f'cap_{k}', current.get(k, catalog.OFF))
+                                       for k in catalog.OPTIONAL})
+
+
+def _require_rendered(post, sentinel, what):
+    """Multi-selects and checkbox groups post nothing when emptied, so
+    "nothing posted" only means "clear" when the form's hidden `sentinel`
+    shows the control was rendered and submitted."""
+    if sentinel not in post:
+        raise ValueError(f'{what} were not part of the submission; nothing was changed.')
 
 
 def _report_change(request, change, applied_text):
@@ -146,7 +160,7 @@ def _handle(request):
             messages.success(request, f'Created {clone.name}. Edit it below.')
         elif action in ('preview_preset', 'save_preset'):
             preset = get_object_or_404(AccessPreset, pk=p.get('preset'))
-            caps = _caps_from_post(p)
+            caps = _caps_from_post(p, preset.capabilities)
             if action == 'preview_preset':
                 return render(request, 'tech_access/index.html', _context(
                     request, preset_plan=services.plan_preset_change(preset, caps), preset_edit=preset,
@@ -164,14 +178,24 @@ def _handle(request):
                 messages.success(request, f'Group {name} created.')
         elif action == 'group_members':
             group = get_object_or_404(TechnicianGroup, pk=p.get('group'))
+            _require_rendered(p, 'members_present', 'Group members')
             users = [_user(pk) for pk in p.getlist('members')]
             applied, change, _ = services.set_group_members(group, users, me, request)
             _report_change(request, change, f'Members of {group.name} updated.')
         elif action == 'customer_policy':
             org = get_object_or_404(Organization, pk=p.get('organization'))
-            preset = AccessPreset.objects.filter(pk=p.get('default_preset')).first() if p.get('default_preset') else None
-            services.set_default_preset(org, preset, me)
-            change = services.set_restrictions(org, p.getlist('restricted'), me, request)
+            # Each part is applied only when the POST carries it: a missing
+            # default preset is not "reset to L1", and a missing restriction
+            # list is not "lift every restriction".
+            if 'default_preset' in p:
+                raw = p.get('default_preset')
+                preset = AccessPreset.objects.filter(pk=raw).first() if str(raw).isdigit() else None
+                if raw and preset is None:
+                    raise ValueError('Unknown preset.')
+                services.set_default_preset(org, preset, me)
+            change = None
+            if 'restricted_present' in p:
+                change = services.set_restrictions(org, p.getlist('restricted'), me, request)
             _report_change(request, change, f'Settings for {org.name} saved.')
         elif action == 'add_deny':
             u = _user(p.get('user'))
@@ -195,11 +219,19 @@ def _handle(request):
                              cancel=action == 'cancel_change')
             messages.success(request, 'Done.')
         elif action == 'detection':
-            values = {'enabled': p.get('enabled') == 'on', 'notify_customers': p.get('notify_customers') == 'on',
-                      'recipients': p.get('recipients', ''),
+            # Anything the POST does not carry keeps its current setting: the
+            # two checkboxes only read as "off" when `detection_flags` shows
+            # they were rendered, and a missing containment mode is not
+            # "contain".
+            current = DetectionSettings.load()
+            flags = 'detection_flags' in p
+            values = {'enabled': (p.get('enabled') == 'on') if flags else current.enabled,
+                      'notify_customers': (p.get('notify_customers') == 'on') if flags else current.notify_customers,
+                      'recipients': p.get('recipients', current.recipients),
                       'thresholds': {r: {w: int(p.get(f't_{r}_{w}') or v) for w, v in ws.items()}
                                      for r, ws in detection.thresholds().items()},
-                      'containment': {lvl: ('alert' if p.get(f'c_{lvl}') == 'alert' else 'contain')
+                      'containment': {lvl: (p.get(f'c_{lvl}') if p.get(f'c_{lvl}') in ('alert', 'contain')
+                                            else detection.containment_mode(lvl))
                                       for lvl in ('0', '1', '2', '3')}}
             change = services.propose_detection(values, me, request)
             _report_change(request, change, 'Theft detection settings saved.')
@@ -218,6 +250,7 @@ def _handle(request):
                 acknowledged_by=me, acknowledged_at=timezone.now())
         elif action == 'approvers':
             User = get_user_model()
+            _require_rendered(p, 'approvers_present', 'Approvers')
             current = set(ProtectionSettings.load().approvers.values_list('pk', flat=True))
             want = set(User.objects.filter(pk__in=p.getlist('approvers'), is_superuser=True,
                                            is_active=True).values_list('pk', flat=True))
@@ -283,4 +316,72 @@ def superuser_policy(request):
             status=ProtectedChange.PENDING).select_related('requested_by', 'reviewed_by', 'target_user')[:20],
         'fresh_auth': protected.has_fresh_auth(request),
         'is_approver': protected.is_approver(request.user),
+    })
+
+
+# --- "why": the chain behind one decision ------------------------------------
+
+def _all_capabilities():
+    return [(k, v[0]) for k, v in catalog.OPTIONAL.items()] + [(k, v[0]) for k, v in catalog.LOCKED.items()]
+
+
+@login_required
+@user_passes_test(_admin)
+def why(request):
+    """Why can this technician do this for this customer, who granted it,
+    and when does it expire? Security administrators only; reads only rows
+    at the chosen customer (see tech_access.explain)."""
+    from .explain import explain
+    result = None
+    g = request.GET
+    user_pk, org_pk, cap = g.get('user', ''), g.get('organization', ''), g.get('capability', '')
+    if user_pk and org_pk and cap:
+        if cap not in catalog.OPTIONAL and cap not in catalog.LOCKED:
+            raise Http404()
+        if not (user_pk.isdigit() and org_pk.isdigit()):
+            raise Http404()
+        tech = get_object_or_404(get_user_model(), pk=user_pk)
+        org = get_object_or_404(Organization, pk=org_pk)
+        result = explain(tech, org, cap)
+    return render(request, 'tech_access/why.html', {
+        'active_page': 'technician_access',
+        'result': result,
+        'technicians': technicians(),
+        'organizations': Organization.objects.filter(is_active=True).order_by('name'),
+        'capabilities': _all_capabilities(),
+        'sel': {'user': user_pk, 'organization': org_pk, 'capability': cap},
+    })
+
+
+@login_required
+@user_passes_test(_admin)
+def assignment_detail(request, pk):
+    """One assignment record: who, where, preset, granted by/at, expiry,
+    revocation, the approving protected change and its audit history."""
+    from .explain import _approval_for_assignment, _audit, _change_history
+    a = get_object_or_404(AccessAssignment.objects.select_related(
+        'preset', 'user', 'group', 'organization', 'granted_by', 'revoked_by'), pk=pk)
+    approval = _approval_for_assignment(a)
+    history = sorted({e.pk: e for e in _audit('tech_access_assignment', a.pk, limit=100)
+                      + _change_history(approval)}.values(),
+                     key=lambda e: (e.timestamp, e.pk), reverse=True)
+    caps = a.preset.caps()
+    return render(request, 'tech_access/assignment_detail.html', {
+        'active_page': 'technician_access', 'a': a, 'status': a.status(), 'approval': approval,
+        'history': history, 'caps': [(k, v[0], caps.get(k, catalog.OFF)) for k, v in catalog.OPTIONAL.items()],
+    })
+
+
+@login_required
+@user_passes_test(_admin)
+def change_detail(request, pk):
+    """One protected change: requester, confirmation, reviewer, what it
+    widened, its status and its audit trail."""
+    from .explain import _change_history
+    change = get_object_or_404(ProtectedChange.objects.select_related('requested_by', 'reviewed_by', 'target_user'),
+                               pk=pk)
+    return render(request, 'tech_access/change_detail.html', {
+        'active_page': 'technician_access', 'change': change, 'history': _change_history(change),
+        'assignments': AccessAssignment.objects.filter(approved_change=change).select_related(
+            'organization', 'preset'),
     })

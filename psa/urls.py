@@ -1,6 +1,6 @@
 from django.urls import path
 
-from . import views
+from . import requester_site_views, views
 
 app_name = 'psa'
 
@@ -9,8 +9,10 @@ urlpatterns = [
     path('new/', views.ticket_create, name='ticket_create'),
     path('new/assets/', views.ticket_client_assets, name='ticket_client_assets'),
     path('settings/', views.psa_global_settings_view, name='settings'),
-    # Legacy per-client URL — redirects to the new global page.
+    # Per-customer settings: native PSA opt-out and the customer portal.
     path('settings/client/', views.client_settings_view, name='client_settings'),
+    # Phase 60.6: requesters' default ticket sites for the selected customer.
+    path('requester-sites/', requester_site_views.requester_sites, name='requester_sites'),
     # Canned replies (Phase 2b)
     path('canned/', views.canned_reply_list, name='canned_reply_list'),
     path('canned/new/', views.canned_reply_create, name='canned_reply_create'),
@@ -21,6 +23,10 @@ urlpatterns = [
     path('catalog/<int:pk>/edit/', views.service_catalog_form, name='service_catalog_edit'),
     path('catalog/<int:pk>/approvers/', views.service_catalog_approvers, name='service_catalog_approvers'),
     # Time entries
+    # Phase 12: two-way secure messages.
+    path('t/<str:ticket_number>/secure-replies/<int:pk>/reveal/', views.secure_reply_reveal,
+         name='secure_reply_reveal'),
+    path('secure-reply/<str:token>/', views.secure_reply_submit, name='secure_reply_submit'),
     path('t/<str:ticket_number>/timer/start/', views.timer_start, name='timer_start'),
     path('t/<str:ticket_number>/timer/stop/', views.timer_stop, name='timer_stop'),
     path('t/<str:ticket_number>/time/manual/', views.time_entry_manual, name='time_entry_manual'),
@@ -108,6 +114,9 @@ urlpatterns = [
     path('rules/new/', views.workflow_rule_form, name='workflow_rule_create'),
     path('rules/<int:pk>/edit/', views.workflow_rule_form, name='workflow_rule_edit'),
     path('rules/<int:pk>/delete/', views.workflow_rule_delete, name='workflow_rule_delete'),
+    # Phase 14: visual flow of one rule / of every rule with its chains
+    path('rules/<int:pk>/flow/', views.workflow_rule_flow, name='workflow_rule_flow'),
+    path('rules/flow/', views.workflow_rule_flow, name='workflow_rule_map'),
     # Phase 14 v9 (v3.17.288): workflow rule templates
     path('rules/templates/', views.workflow_template_list,
          name='workflow_template_list'),
@@ -124,7 +133,12 @@ urlpatterns = [
     path('dispatch/', views.dispatch_board, name='dispatch_board'),
     path('dispatch/assign/', views.dispatch_assign, name='dispatch_assign'),
     path('dispatch/heatmap/', views.dispatch_heatmap, name='dispatch_heatmap'),
+    path('dispatch/travel/<str:ticket_number>/', views.dispatch_travel, name='dispatch_travel'),
     # Invoices + payments (Workstream 5 billing)
+    # Phase 36: per-cycle agreement billing review (approve / hold).
+    path('billing-review/', views.billing_review, name='billing_review'),
+    path('billing-review/invoices/<int:pk>/decide/', views.billing_review_decide,
+         name='billing_review_decide'),
     path('invoices/', views.invoice_list, name='invoice_list'),
     path('invoices/new/', views.invoice_form, name='invoice_create'),
     path('invoices/<int:pk>/', views.invoice_detail, name='invoice_detail'),
@@ -150,6 +164,8 @@ urlpatterns = [
     # Quote PDF + email
     path('quotes/<int:pk>/pdf/', views.quote_pdf, name='quote_pdf'),
     path('quotes/<int:pk>/email/', views.quote_email, name='quote_email'),
+    path('quotes/<int:pk>/signature/evidence/', views.quote_signature_evidence,
+         name='quote_signature_evidence'),
     # Client account + charges + aging
     path('clients/<int:org_id>/account/', views.client_account, name='client_account'),
     path('clients/<int:org_id>/charge/', views.charge_add, name='charge_add'),
@@ -166,6 +182,8 @@ urlpatterns = [
     # Phase 25 v2 (v3.17.249) — bulk decide + payroll CSV export.
     path('timesheet-approvals/bulk/', views.timesheet_bulk_decide, name='timesheet_bulk_decide'),
     path('timesheet-approvals/payroll-export/', views.timesheet_payroll_export, name='timesheet_payroll_export'),
+    path('time-entries/<int:pk>/history/', views.time_entry_history, name='time_entry_history'),
+    path('time-entries/<int:pk>/correct/', views.time_entry_correct, name='time_entry_correct'),
 
     # Procurement (Phase 4.1) — Purchase Requisitions
     path('requisitions/', views.requisition_list, name='requisition_list'),

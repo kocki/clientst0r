@@ -80,13 +80,56 @@ only.
 Nothing is cached. Demotion, revocation, expiry and policy changes apply to the next request — including a job
 already queued, which the gateway re-checks before calling a model.
 
+## Why can this technician do this?
+
+**Admin → Security → Technician Access → Why** (`/settings/security/technician-access/why/`), or **Why?** on any row
+of the effective-access preview. Pick a technician, a customer and a capability. The page shows the same decision the
+ticket tools make (Allowed, Request, Off, Unavailable or Locked) and the chain of records behind it at that customer:
+
+| Source | What it shows |
+|---|---|
+| Mandatory safeguard | For a locked capability, the safeguard. Nothing else can change it. |
+| MSP technician standing | Why the account counts as a technician (superuser, staff flag, or staff user type and global role). Required, but grants nothing by itself. For a superuser it links the approved **Superuser grant** change, if there was one. |
+| Membership at the customer | The membership role there. Shown for completeness; it grants no ticket AI or RMM capability. |
+| Containment | Active theft-detection containment, which turns everything off. |
+| Explicit deny | Denies at this customer or everywhere, active or expired, with who added them and when they end. |
+| Customer restriction | Whether the customer has switched the capability off for everyone. |
+| Paired RMM | Each paired RMM at the customer, whether it advertises what the capability needs, and the approved pairing change. |
+| Assignment | Every assignment at the customer for the technician or one of their groups — active, **expired** and **revoked** — with the state its preset gives, who granted it and when, the expiry, who revoked it and when. Expired and revoked ones are marked *not counted*. |
+
+The source that decides the outcome is marked **decides it**, and the page says when the access ends: the expiry of
+the assignment that grants it (the latest one if several do), never if one of them has no expiry, or when the deny ends.
+Group assignments also end when the technician leaves the group.
+
+Each source links to its record and its approval, and lists its audit history with **before → after** values:
+
+- **Assignment record** (`…/technician-access/assignments/<id>/`): preset, customer, granted by, expiry, revocation,
+  the approving protected change, what the preset gives now, and the audit trail (created, revoked, the change's
+  proposal, confirmation and approval).
+- **Protected change** (`…/technician-access/changes/<id>/`): requester, confirmation, reviewer, what it widened,
+  who was notified, the assignment it created, and its audit trail.
+- Group membership changes for that technician, preset capability changes, customer restriction changes, deny
+  creation and lifting, membership role changes and staff user-type / global-role changes.
+
+Only security administrators (superusers, the same people who manage technician access) can open these pages. The
+"why" page reads rows at the chosen customer only — another customer's assignments, denies, restrictions, pairings and
+memberships never appear.
+
+**Upgrade notes.** Assignments now record the protected change that created them and who revoked them. Assignments
+made before this release are matched to their change by customer, preset, technician or group and approval time;
+their revoker is unknown (the audit entry still names who revoked them). Before/after values appear on audit entries
+written from this release on; older entries show their description only. Membership role and staff user-type changes
+are audited from this release on, naming the signed-in user who made them (or no one, for changes made from the
+command line).
+
 ## Admin setup
 
 1. **Settings → Ticket AI models.** Create model profiles: Anthropic, OpenAI or Ollama.
    - API keys are write-only, sealed to the gateway key, and can't be shown again.
    - An Ollama address only works after **Propose address** is approved as a protected change.
 2. On the same page, set each customer's **AI policy**: analysis, compare, allowed models, default model,
-   technician-owned keys, local-only, and daily budget. Without a policy, a customer allows no AI.
+   technician-owned keys, local-only, daily budget and history retention (see
+   [AI and automation history](#ai-and-automation-history)). Without a policy, a customer allows no AI.
    - With **technician-owned keys** on, technicians can add their own Claude or OpenAI key under
      **My Profile → My AI keys**. Only its owner can use it, and only at customers that allow
      technicians' keys and are not local-only; it doesn't have to be listed in the policy. The
@@ -100,6 +143,8 @@ already queued, which the gateway re-checks before calling a model.
    - Assign presets per technician or group, per customer, optionally with an expiry. **Preview** shows the diff,
      the affected technicians and the expiry before you save.
    - Set customer defaults and restrictions, add denies, and preview anyone's effective access with explanations.
+     **Why?** on a preview row shows who granted it, when it expires, the approval and the audit history
+     ([below](#why-can-this-technician-do-this)).
 5. Run `python manage.py ai_gateway_keygen` once.
 6. Optionally isolate the gateway (see [Vault isolation](#vault-isolation)).
 7. Run `python manage.py tech_access_report` to see:
@@ -206,12 +251,62 @@ AI provider keys are encrypted to an X25519 public key (`AI_GATEWAY_KEY_DIR`, de
 - **`AI_GATEWAY_MODE=worker`**: only `manage.py ai_gateway_worker` running under `config.settings_ai_gateway` opens
   them. That process:
   - drops `APP_MASTER_KEY`, the previous master keys, `SECRET_KEY`, `API_KEY_SECRET` and every other
-    KEY/SECRET/TOKEN/PASSWORD variable;
+    KEY/SECRET/TOKEN/PASSWORD variable, except `DB_PASSWORD`: it reads and writes its rows through the
+    database;
   - refuses to start if it can still see the master key;
   - therefore can't decrypt vault entries, integration credentials or backup secrets.
 
-  Install `deploy/clientst0r-ai-gateway.service` to run it. The unit runs as the same OS user; running it as a
-  separate user that can't read `.env` is a further deployment step and not done automatically.
+### Running the worker as its own OS user
+
+Since v3.17.664, the worker runs as a separate system user, `clientst0r-ai`, that
+cannot read `.env`. Even a bug in the worker or in a provider library can't reach the master key.
+
+**Native install (MariaDB / MySQL).** A fresh `bash install.sh` runs `deploy/setup-ai-gateway-user.sh`. You can skip
+it with `CLIENTST0R_AI_GATEWAY_USER=n`. On an existing install, run that script yourself as the web app's user.
+It:
+
+1. creates `clientst0r-ai` (system user, no home, no shell, its own group only). It is not added to the web app's
+   group, because that group can be a privileged one such as `docker` or `adm`. The worker reads the code and the
+   venv the way any local user can. Where a directory above the code is closed (for example a 0750 home
+   directory), an ACL gives `clientst0r-ai` traverse-only access to the parent directories, and read and traverse
+   access to the install directory. This needs the `acl` package.
+2. stops without changing anything if `clientst0r-ai` could read `.env`, `.env.backup`, the `backups/` directory
+   or the web app's own gateway private key. It also stops if `clientst0r-ai` can't read the code.
+3. keeps the key pair in `/etc/clientst0r/ai-gateway/`:
+   - the directory is `clientst0r-ai:<app group>`, mode 0750;
+   - `private.key` is 0600 and owned by `clientst0r-ai`;
+   - `public.key` is 0644.
+
+   If the web app already has a pair, the script moves it there and deletes the web app's copy of the private key.
+   Provider keys you already saved keep working. Otherwise it generates a new pair as `clientst0r-ai`.
+4. writes `/etc/clientst0r/ai-gateway.env` (root-only, mode 0600) with the `DB_*` settings from `.env`. It writes
+   nothing else secret, and systemd reads the file before it drops privileges.
+5. sets `AI_GATEWAY_MODE=worker` and `AI_GATEWAY_KEY_DIR=/etc/clientst0r/ai-gateway` in `.env`. Then it installs
+   and starts `clientst0r-ai-gateway.service` (`User=clientst0r-ai`) and checks that the running worker's
+   environment has no `APP_MASTER_KEY`.
+
+Afterwards, restart the web app (`sudo systemctl restart clientst0r-gunicorn.service`) so it reads the new mode.
+SQLite installs are refused: SQLite writes its journal next to the database, so the worker would need write access
+to the install directory, which would let it change the web app's code. On SQLite the worker stays in the
+default mode.
+
+**Docker.** The `ai-gateway` compose profile runs the worker as uid 1001 (`clientst0r-ai`). It has no `env_file`,
+so it gets only the database settings. It owns the private key in the `clientst0r-ai-gateway-keys` volume. The
+`app` service mounts that volume read-only and can read `public.key` only. To set it up:
+
+1. Set `AI_GATEWAY_MODE=worker` and `AI_GATEWAY_KEY_DIR=/var/lib/clientst0r/ai-gateway` in `.env`.
+2. Run `docker compose --profile ai-gateway run --rm ai-gateway python manage.py ai_gateway_keygen --group-readable`.
+3. Run `docker compose --profile ai-gateway up -d`.
+
+Provider keys saved before this were sealed to a different pair, so you must enter them again.
+
+**CI.** The native-install job in `.github/workflows/install-upgrade.yml` checks that a fresh install:
+
+- runs the worker as `clientst0r-ai`;
+- leaves that user unable to read `.env`;
+- leaves the web app's user unable to read the private key;
+- keeps `APP_MASTER_KEY` and `SECRET_KEY` out of the worker's environment;
+- lets the worker reach the database.
 
 Model calls only go to:
 
@@ -269,3 +364,81 @@ name another device.
 
 Source: `psa_ai/services/rmm_actions.py`, `psa_ai/rmm_views.py`, `integrations/ticket_rmm.py`; tests
 `psa_ai/tests_rmm.py`.
+
+## AI and automation history
+
+*v3.17.660.* The ticket page has an **AI and automation history** card (below Routing): one chronological,
+staff-only timeline of everything AI or automation did on the ticket. The same entries are available as JSON at
+`GET /psa/ai/assist/<ticket>/history/`. Nothing on the card or the route contacts an RMM, Rem0te or a model
+provider; it reads stored rows only.
+
+Each entry shows, where it applies:
+
+- **Model and profile** — for an analysis run, the profile name and the provider/model it actually ran
+  (recorded when the gateway executed it, so a later profile edit doesn't rewrite history); for older
+  reply/action/triage drafts, the model name.
+- **Prompt version** — `<prompt file>@<first 12 hex of its SHA-256>`, e.g. `system_reply.md@3f9c0a1b2d4e`. It
+  changes only when the prompt file's bytes change. Drafts made before v3.17.660 show
+  `1 (legacy, no content hash)`. The prompt text itself is never stored with a draft or shown.
+- **Human decision** — who did what, when: approval requested, approved / applied / marked helpful, rejected
+  (with the reviewer's note), and for AI draft replies *Sent to the customer unchanged*, *Edited, then sent*,
+  *Kept as an internal note* or *Send refused* (no *Send reviewed AI replies*). Draft decisions are recorded by
+  the server when the comment is posted, by matching the posted text against this ticket's own drafts; the
+  composer's draft marker is only a hint and is ignored if it names another ticket's draft.
+- **Approval requirement and expiry** — suggested ticket changes need *Apply AI-suggested changes* or a
+  reviewer with *Review other technicians' work* (no expiry; it waits for a reviewer). Fix referrals and Rem0te
+  action proposals are approved only in the RMM, by its approvers: the entry shows how many approvals Rem0te
+  requires, whether customer sign-off is required, when Rem0te's approval window closes (`window.not_after`),
+  and the approval link while it is open. ClientSt0r never approves or runs anything. Handoffs and diagnostics
+  show when ClientSt0r stops waiting for an answer.
+- **Rem0te outcome** — analysis job status and Rem0te's error code (e.g. `FORBIDDEN`), per-run status and
+  errors; for action proposals Rem0te's status, outcome and observed result (e.g. `after10s=running`).
+- **Routing** — each routing decision (status, trigger, mode, rule version, previous → new assignment, reason),
+  marked: *Routing changes assignment, queue and team only. It never started a remote session or authorized an
+  endpoint action.*
+- **Alert tickets** — a ticket opened from a Rem0te alert shows the alert's computer, kind, severity, state and
+  whether the link back to Rem0te succeeded.
+
+Vault reveal approvals are not ticket events (a reveal request isn't linked to a ticket), so they are not in this
+timeline; they stay under Vault → Reveal requests.
+
+### Who sees it
+
+| Viewer | Sees |
+|---|---|
+| Customer users, the customer portal | Nothing. The card is never rendered and the JSON route answers 404. |
+| MSP staff without a live technician-access assignment at the ticket's customer | Nothing (the JSON route answers 403), even though PSA lets MSP staff open the ticket page. |
+| Technicians assigned at the customer | RMM requests, Rem0te proposals, alert tickets and routing — these work with AI off, like the RMM and Routing panels. |
+| …who also hold AI output access on this ticket (*Analyze ticket* or *AI reply drafts*; on someone else's ticket also *Review other technicians' work*) | The AI entries too. |
+
+**When AI is off** — the master switch (`psa_ai_enabled`) is off, or the customer's AI policy is missing or has
+analysis switched off — the AI entries already recorded stay visible to those technicians as an audit record
+(model, profile, prompt version, status, decisions, outcome), but no AI-written text is shown. Viewing the history
+never generates anything.
+
+**Redaction.** No prompt, evidence document, request sent to an RMM, context snapshot or provider key is shown.
+The short excerpt on an AI entry (only while AI is on) is the stored, already-redacted model output, passed through
+the same redaction again and cut to 300 characters.
+
+### Retention
+
+Each customer's **AI policy** (**Settings → Ticket AI models**, `/psa/ai/profiles/`) has **History retention days**. Blank uses the
+installation default, `PSA_AI_HISTORY_RETENTION_DAYS` in `.env` (365); `0` keeps history until deleted by hand.
+
+- Entries older than the window drop out of the timeline immediately.
+- The `poll_analysis_jobs` scheduled task (every minute) purges at most every six hours: AI drafts and
+  suggestions (with their apply logs and draft decisions), finished analysis jobs (with their runs and Rem0te
+  events), finished RMM requests (with their events) and draft decisions older than the window.
+  `manage.py prune_ai_history` purges now.
+- Kept regardless of age: suggestions awaiting approval, analysis jobs and RMM requests that are still open,
+  routing decisions (they stop a repeated trigger from routing twice and drive the reroute loop guard) and alert
+  → ticket links (they stop a repeated alert from opening a second ticket). The audit log has its own retention.
+
+**Upgrading.** Migration `psa_ai 0006_ticket_ai_history` adds the new columns and tables; nothing is backfilled.
+Existing drafts keep prompt version `1`, existing analysis runs show no prompt version ("not run") and
+"<provider>/<model> (as configured now)", and existing proposals gain approval details the next time Rem0te's
+status is read. Draft decisions are recorded from the upgrade on. The first purge runs within a minute of the
+upgrade, so history already older than 365 days (or a customer's window) is deleted then.
+
+Source: `psa_ai/services/history.py`, `psa_ai/services/prompt_versions.py`, `psa_ai/templatetags/ai_history.py`;
+tests `psa_ai/tests_history.py`.

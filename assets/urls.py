@@ -8,6 +8,8 @@ from . import quick_views
 from . import port_config_views
 from . import port_views
 from . import views_custom
+from . import workspace_views
+from . import workspace_refresh
 
 app_name = 'assets'
 
@@ -17,6 +19,9 @@ urlpatterns = [
     path('quick/pc/', quick_views.quick_pc_add, name='quick_pc_add'),
     path('quick/server/', quick_views.quick_server_add, name='quick_server_add'),
     path('<int:pk>/', views.asset_detail, name='asset_detail'),
+    path('<int:pk>/workspace/', workspace_views.device_workspace, name='device_workspace'),
+    path('workspace/', workspace_views.device_workspace_home, name='device_workspace_home'),
+    path('<int:pk>/workspace/refresh/', workspace_refresh.refresh_from_rmm, name='device_workspace_refresh'),
     path('<int:pk>/edit/', views.asset_edit, name='asset_edit'),
     path('<int:pk>/delete/', views.asset_delete, name='asset_delete'),
     path('<int:pk>/generate-profile/', views.asset_generate_profile, name='asset_generate_profile'),
@@ -51,6 +56,10 @@ urlpatterns = [
     path('rma/create/', views.rma_create, name='rma_create'),
     path('rma/<int:pk>/', views.rma_detail, name='rma_detail'),
     path('rma/<int:pk>/transition/', views.rma_transition, name='rma_transition'),
+
+    # Phase 13 — serial lifecycle history
+    path('serials/', views.serial_search, name='serial_search'),
+    path('<int:pk>/serial-events/add/', views.asset_serial_event_add, name='asset_serial_event_add'),
 
     # Custom fields and custom asset types (v3.17.621)
     path('custom-fields/', views_custom.custom_field_list, name='custom_field_list'),

@@ -96,6 +96,13 @@ class AccessAssignment(models.Model):
                                    related_name='+')
     note = models.CharField(max_length=200, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    # The protected change that created this assignment (when
+    # it widened access) and who revoked it. Older rows are matched to their
+    # change by payload in tech_access.explain.
+    approved_change = models.ForeignKey('ProtectedChange', on_delete=models.SET_NULL, null=True, blank=True,
+                                        related_name='+')
+    revoked_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+                                   related_name='+')
 
     objects = AccessAssignmentQuerySet.as_manager()
 
@@ -115,6 +122,15 @@ class AccessAssignment(models.Model):
     @property
     def subject_label(self):
         return self.user.get_username() if self.user_id else f'Group: {self.group.name}'
+
+    def status(self, now=None) -> str:
+        """'revoked', 'expired' or 'active'."""
+        now = now or timezone.now()
+        if self.revoked_at:
+            return 'revoked'
+        if self.expires_at and self.expires_at <= now:
+            return 'expired'
+        return 'active'
 
 
 class CustomerAccessPolicy(models.Model):
@@ -161,6 +177,8 @@ class ProtectedChange(models.Model):
         ('account_email', 'Account e-mail address'),
         ('superuser_grant', 'Superuser grant'),
         ('superuser_policy', 'Superuser-grant approval policy'),
+        ('global_role', 'Global role with an RMM tier'),
+        ('rmm_tier', 'Role template RMM tier'),
     ]
     PENDING, APPLIED, REJECTED, CANCELLED, EXPIRED = 'pending', 'applied', 'rejected', 'cancelled', 'expired'
     STATUSES = [(s, s.title()) for s in (PENDING, APPLIED, REJECTED, CANCELLED, EXPIRED)]

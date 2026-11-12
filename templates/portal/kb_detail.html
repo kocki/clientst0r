@@ -13,11 +13,14 @@
 
 <div class="card">
     <div class="card-body">
-        {# Render the body — content_type can be 'html' or 'markdown'. Trust the staff-published content. #}
-        {% if article.content_type == 'markdown' %}
-            {{ article.body|linebreaksbr }}
-        {% else %}
-            {{ article.body|safe }}
+        {# Sanitised render with internal-only blocks removed (Document.render_for_client). #}
+        {{ article_html|safe }}
+        {% if article.content_type == 'file' and article.file %}
+        <p class="mb-0 {% if article_html %}mt-3{% endif %}">
+            <a href="{% url 'portal:kb_download' article.slug %}" class="btn btn-primary">
+                <i class="fas fa-download me-1"></i>Download{% if article.file_size %} ({{ article.file_size|filesizeformat }}){% endif %}
+            </a>
+        </p>
         {% endif %}
     </div>
 </div>

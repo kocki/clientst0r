@@ -53,6 +53,12 @@ COMMAND_TASKS = {
     'update_geoip_db': ('update_geoip_db', ['--max-age-days', '25']),
     'rmm_sync': ('sync_rmm', []),
     'poll_analysis_jobs': ('poll_analysis_jobs', []),
+    'run_migration_rehearsals': ('run_migration_rehearsals', []),
+    'send_security_digests': ('send_security_digests', []),
+    'psa_purge_secure_replies': ('psa_purge_secure_replies', []),
+    'agreement_reminders': ('agreement_reminders', []),
+    'kb_link_check': ('kb_link_check', []),
+    'ldap_group_sync': ('ldap_group_sync', []),
 }
 
 

@@ -18,8 +18,8 @@ from django.shortcuts import get_object_or_404, redirect, render
 from audit.models import AuditLog
 from core.models import Organization
 
-from .models import AIBusinessPolicy, AIModelProfile
-from .services import gateway_keys
+from .models import AIBusinessPolicy, AIInstallationSettings, AIModelProfile
+from .services import budget, gateway_keys
 
 
 def _admin(user):
@@ -62,15 +62,74 @@ class ProfileForm(forms.ModelForm):
 class PolicyForm(forms.ModelForm):
     class Meta:
         model = AIBusinessPolicy
-        fields = ['analysis_enabled', 'compare_enabled', 'allowed_profiles', 'default_profile',
-                  'allow_technician_credentials', 'local_only', 'daily_budget_cents']
+        fields = ['ai_excluded', 'analysis_enabled', 'compare_enabled', 'allowed_profiles', 'default_profile',
+                  'allow_technician_credentials', 'local_only', 'daily_budget_cents', 'monthly_budget_cents',
+                  'history_retention_days',
+                  # AI Troubleshoot
+                  'troubleshoot_enabled', 'primary_profile', 'secondary_profile', 'multi_model_enabled',
+                  'model_routing', 'troubleshoot_daily_runs', 'troubleshoot_technician_daily_runs',
+                  # Information-sharing rules
+                  'share_ticket_text', 'share_device_data', 'share_network_identifiers', 'share_contact_data',
+                  'share_kb_titles']
+
+    KEEP_WHEN_OMITTED = ('model_routing', 'troubleshoot_daily_runs', 'troubleshoot_technician_daily_runs')
+
+    def clean(self):
+        c = super().clean()
+        for name in self.KEEP_WHEN_OMITTED:  # an older form post leaves these as they were
+            if c.get(name) in (None, ''):
+                c[name] = getattr(self.instance, name)
+        allowed = set(c.get('allowed_profiles') or [])
+        for name in ('primary_profile', 'secondary_profile'):
+            p = c.get(name)
+            if p is not None and p not in allowed and p.credential_owner != AIModelProfile.OWNER_TECHNICIAN:
+                self.add_error(name, 'Choose one of the allowed profiles.')
+        if c.get('primary_profile') and c.get('primary_profile') == c.get('secondary_profile'):
+            self.add_error('secondary_profile', 'The secondary model must differ from the primary.')
+        if c.get('multi_model_enabled') and not (c.get('primary_profile') and c.get('secondary_profile')):
+            self.add_error('multi_model_enabled', 'Multi-model analysis needs a primary and a secondary model.')
+        return c
 
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
+        for name in self.KEEP_WHEN_OMITTED:
+            self.fields[name].required = False
         for f in self.fields.values():
             f.widget.attrs.setdefault('class', 'form-check-input' if isinstance(f.widget, forms.CheckboxInput)
                                       else 'form-select' if isinstance(f.widget, (forms.Select, forms.SelectMultiple))
                                       else 'form-control')
+
+
+class InstallationForm(forms.ModelForm):
+    """Installation-wide AI settings: the monthly cap across all customers
+    and AI Troubleshoot's read-only command allowlist."""
+    class Meta:
+        model = AIInstallationSettings
+        fields = ['monthly_budget_cents', 'command_allowlist']
+        labels = {'monthly_budget_cents': 'Installation-wide monthly AI budget (cents)',
+                  'command_allowlist': 'Read-only command allowlist (AI Troubleshoot)'}
+        widgets = {'command_allowlist': forms.Textarea(attrs={'rows': 6, 'class': 'form-control font-monospace',
+                                                              'placeholder': 'Get-Service *\nipconfig /all\n'
+                                                                             'df -h*'})}
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.fields['monthly_budget_cents'].widget.attrs.setdefault('class', 'form-control')
+
+    def clean_command_allowlist(self):
+        from .services.troubleshoot_result import allowlist_errors
+        text = self.cleaned_data.get('command_allowlist') or ''
+        errors = allowlist_errors(text)
+        if errors:
+            raise forms.ValidationError(errors)
+        return text
+
+
+def _installation_usage():
+    used, cap = budget.installation_usage()
+    return {'used_cents': round(used / 100, 2), 'cap_cents': None if cap is None else cap // 100,
+            'remaining_cents': None if cap is None else round(max(0, cap - used) / 100, 2),
+            'exhausted': bool(budget.installation_refusal())}
 
 
 def _status():
@@ -118,6 +177,24 @@ def profiles(request):
             return redirect(request.path)
     else:
         form = ProfileForm(instance=edit)
+    settings_row = AIInstallationSettings.load()
+    if request.method == 'POST' and request.POST.get('action') == 'installation':
+        install_form = InstallationForm(request.POST, instance=settings_row)
+        if install_form.is_valid():
+            before = settings_row.monthly_budget_cents
+            row = install_form.save(commit=False)
+            row.updated_by = request.user
+            row.save()
+            from .services.troubleshoot_result import parse_allowlist
+            AuditLog.log(user=request.user, action='update', object_type='psa_ai.AIInstallationSettings',
+                         object_id=row.pk, object_repr='AI installation settings',
+                         description='Installation-wide AI settings saved',
+                         extra_data={'monthly_budget_cents': row.monthly_budget_cents, 'before': before,
+                                     'allowlist_patterns': len(parse_allowlist(row.command_allowlist))})
+            messages.success(request, 'Installation-wide AI settings saved.')
+            return redirect(request.path)
+    else:
+        install_form = InstallationForm(instance=settings_row)
     if request.method == 'POST' and request.POST.get('action') == 'approve_destination':
         from tech_access.services import propose_destination
         profile = get_object_or_404(AIModelProfile, pk=request.POST.get('pk'), provider='ollama')
@@ -131,6 +208,7 @@ def profiles(request):
     return render(request, 'psa_ai/profiles.html', {
         'profiles': AIModelProfile.objects.prefetch_related('assigned_organizations'),
         'form': form, 'edit': edit, 'gateway': _status(),
+        'install_form': install_form, 'install_usage': _installation_usage(),
         'organizations': Organization.objects.filter(is_active=True).order_by('name'),
         'policies': {p.organization_id: p for p in AIBusinessPolicy.objects.prefetch_related('allowed_profiles')},
     })
@@ -147,11 +225,20 @@ def policy(request, org_id):
         AuditLog.log(user=request.user, action='update', organization=org, object_type='ai_business_policy',
                      object_id=p.pk, object_repr=f'AI policy for {org.name}', description=f'AI policy for {org.name} saved',
                      extra_data={'analysis': p.analysis_enabled, 'compare': p.compare_enabled,
+                                 'excluded': p.ai_excluded, 'troubleshoot': p.troubleshoot_enabled,
+                                 'multi_model': p.multi_model_enabled, 'routing': p.model_routing,
+                                 'primary': p.primary_profile_id, 'secondary': p.secondary_profile_id,
+                                 'monthly_budget_cents': p.monthly_budget_cents,
+                                 'sharing': {'ticket_text': p.share_ticket_text, 'device_data': p.share_device_data,
+                                             'network_identifiers': p.share_network_identifiers,
+                                             'contact_data': p.share_contact_data, 'kb_titles': p.share_kb_titles},
                                  'local_only': p.local_only, 'budget_cents': p.daily_budget_cents,
+                                 'history_retention_days': p.history_retention_days,
                                  'profiles': list(p.allowed_profiles.values_list('pk', flat=True))})
         messages.success(request, f'AI policy for {org.name} saved.')
         return redirect('psa_ai:profiles')
-    return render(request, 'psa_ai/policy.html', {'form': form, 'organization': org})
+    return render(request, 'psa_ai/policy.html', {'form': form, 'organization': org,
+                                                  'install_usage': _installation_usage()})
 
 
 # --- technicians' own keys ----------------------------------------------------

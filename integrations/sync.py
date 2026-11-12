@@ -15,6 +15,7 @@ from .models import (
 )
 from .providers import get_provider
 from .providers.rmm import get_rmm_provider
+from . import rmm_snapshots
 from .rmm_association import (
     apply_customer_decision, associate, clean_external_id, customer_identity, resolve_customer, set_device_organization,
 )
@@ -67,7 +68,34 @@ def apply_sync_outcome(connection, stats, sync_start):
     connection.last_sync_status = 'partial' if error_summary else 'success'
     connection.last_error = error_summary[:500]
     connection.save()
+    _record_health(connection, connection.last_sync_status, stats, error_summary, sync_start)
     return error_summary
+
+
+def _health_kind(connection):
+    return 'rmm' if isinstance(connection, RMMConnection) else 'psa'
+
+
+def _record_health(connection, status, stats, error, when):
+    """Standard health row (integrations.health) next to the legacy fields."""
+    from . import health
+    counts = health.stats_counts(stats)
+    health.record_sync(connection, _health_kind(connection), status=status,
+                       created=counts['created'], updated=counts['updated'],
+                       failed=counts['failed'], error=error,
+                       update_connection=False, when=when)
+
+
+def record_sync_failure(connection, exc, stats, sync_start):
+    """Write a failed run: redacted `last_error` plus standard health."""
+    from . import health
+    error_msg = health.redact_for(connection, exc)
+    connection.last_sync_at = sync_start
+    connection.last_sync_status = 'error'
+    connection.last_error = error_msg[:500]
+    connection.save()
+    _record_health(connection, 'error', stats, error_msg, sync_start)
+    return error_msg
 
 
 def fire_sync_webhook(connection, kind, status, stats=None):
@@ -151,13 +179,11 @@ class PSASync:
             return self.stats
 
         except Exception as e:
-            error_msg = str(e)
+            from .health import redact_for
+            error_msg = redact_for(self.connection, e)
             logger.error(f"Sync failed for {self.connection}: {error_msg}")
 
-            self.connection.last_sync_at = self.sync_start
-            self.connection.last_sync_status = 'error'
-            self.connection.last_error = error_msg[:500]
-            self.connection.save()
+            error_msg = record_sync_failure(self.connection, e, self.stats, self.sync_start)
             fire_sync_webhook(self.connection, 'psa', 'error', self.stats)
 
             AuditLog.log(
@@ -507,6 +533,9 @@ class RMMSync:
             'software': {'created': 0, 'updated': 0, 'deleted': 0, 'errors': 0},
             'organizations': {'created': 0, 'updated': 0, 'errors': 0},
         }
+        if rmm_snapshots.collecting(connection, provider=self.provider):
+            self.stats['services'] = {'collected': 0, 'errors': 0}
+        self._services_done = set()
 
     def sync_all(self):
         """
@@ -540,6 +569,13 @@ class RMMSync:
             if self.connection.sync_software and self.provider.supports_software:
                 self.sync_software()
 
+            # Opt-in service lists, from the provider's existing device
+            # route; lists past retention (or of a connection that stopped
+            # collecting) are deleted either way.
+            if 'services' in self.stats:
+                self.sync_services()
+            rmm_snapshots.purge(self.connection)
+
             # Update connection status — see `apply_sync_outcome`: 'partial'
             # when records were dropped, which also makes the next run a full
             # sync so they are retried rather than skipped forever.
@@ -567,13 +603,11 @@ class RMMSync:
             return self.stats
 
         except Exception as e:
-            error_msg = str(e)
+            from .health import redact_for
+            error_msg = redact_for(self.connection, e)
             logger.error(f"RMM sync failed for {self.connection}: {error_msg}")
 
-            self.connection.last_sync_at = self.sync_start
-            self.connection.last_sync_status = 'error'
-            self.connection.last_error = error_msg[:500]
-            self.connection.save()
+            error_msg = record_sync_failure(self.connection, e, self.stats, self.sync_start)
             fire_sync_webhook(self.connection, 'rmm', 'error', self.stats)
 
             AuditLog.log(
@@ -671,12 +705,18 @@ class RMMSync:
                     # raw_data['id'] is the numeric PK when present. Fall back to external_id
                     # (UUID) so the provider can also try UUID-based paths.
                     numeric_id = raw.get('id')
-                    # Only use as numeric if it's actually an integer (not a UUID string)
-                    if numeric_id and not str(numeric_id).replace('-', '').isalpha():
-                        rmm_id = str(numeric_id)
+                    if self.connection.provider_type != 'tactical_rmm':
+                        # Only Tactical RMM's software route takes the numeric
+                        # key; every other client takes the device's own ID
+                        # (and has no `uuid` argument).
+                        software_data = self.provider.list_software(device.external_id)
                     else:
-                        rmm_id = device.external_id
-                    software_data = self.provider.list_software(rmm_id, uuid=device.external_id)
+                        # Only use as numeric if it's actually an integer (not a UUID string)
+                        if numeric_id and not str(numeric_id).replace('-', '').isalpha():
+                            rmm_id = str(numeric_id)
+                        else:
+                            rmm_id = device.external_id
+                        software_data = self.provider.list_software(rmm_id, uuid=device.external_id)
                     
                     # Track existing software IDs
                     existing_software_ids = set()
@@ -701,17 +741,40 @@ class RMMSync:
                         logger.debug(f"Removed {deleted_count} software items from device {device.external_id}")
                         
                 except Exception as e:
+                    # Stored software is kept: a failed read is not "nothing installed".
                     logger.error(f"Error syncing software for device {device.external_id}: {e}")
+                    self.stats['software']['errors'] += 1
 
         except Exception as e:
             logger.error(f"Error in software sync: {e}")
             raise
 
+    def sync_services(self):
+        """Keep each settled device's service list (opt-in), for the
+        devices whose list didn't already come with the device payload."""
+        devices = RMMDevice.objects.filter(connection=self.connection, organization__isnull=False,
+                                           ownership_status=RMMDevice.OWNERSHIP_RESOLVED)
+        for device in devices.exclude(pk__in=self._services_done):
+            try:
+                services = self.provider.list_services(device.external_id)
+            except Exception as e:
+                logger.error(f"Error collecting services for device {device.external_id}: {e}")
+                self.stats['services']['errors'] += 1
+                continue
+            if services is not None:
+                rmm_snapshots.store(device, 'services', services)
+                self.stats['services']['collected'] += 1
+
     def _enrich_raw_data(self, device_data: dict) -> dict:
         """Merge provider-normalized hardware values into raw_data so the
         asset update can find them even when the original API response uses
-        different/absent field names."""
+        different/absent field names. Lists kept as snapshots (services)
+        never stay in raw_data."""
         raw = dict(device_data.get('raw_data') or {})
+        if getattr(self.provider, 'supports_services', False):
+            services = rmm_snapshots.take_from_raw(raw, 'services')
+            if services is not None:
+                device_data['_services'] = rmm_snapshots.normalize_services(services)
         if device_data.get('ram_gb') is not None:
             raw['_norm_ram_gb'] = device_data['ram_gb']
         if device_data.get('storage'):
@@ -767,6 +830,11 @@ class RMMSync:
 
         if not created and device.organization_id != previous_org:
             set_device_organization(device, device.organization)
+        if (device_data.get('_services') is not None and device.is_exposed
+                and rmm_snapshots.collecting(self.connection, provider=self.provider)):
+            rmm_snapshots.store(device, 'services', device_data['_services'])
+            self._services_done.add(device.pk)
+            self.stats['services']['collected'] += 1
         if created:
             self.stats['devices']['created'] += 1
         else:
@@ -816,6 +884,15 @@ class RMMSync:
             self.stats['alerts']['created'] += 1
         else:
             self.stats['alerts']['updated'] += 1
+        # Optional alert → ticket policy (psa/routing/alert_policy.py). Off
+        # unless an administrator turned it on for synced alerts; never
+        # raises into the sync.
+        try:
+            from psa.routing.alert_policy import rmm_alert_synced
+        except Exception:  # noqa: BLE001
+            rmm_alert_synced = None
+        if rmm_alert_synced is not None:
+            rmm_alert_synced(alert)
         return alert
 
     def _upsert_software(self, device, sw_data):

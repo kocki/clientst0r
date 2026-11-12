@@ -2,7 +2,7 @@
 Integrations URL configuration
 """
 from django.urls import path
-from . import views
+from . import rem0te_views, views
 
 app_name = 'integrations'
 
@@ -29,11 +29,15 @@ urlpatterns = [
 
     # RMM Views
     path('rmm/create/', views.rmm_create, name='rmm_create'),
+    path('rmm/rem0te/setup/', rem0te_views.rem0te_setup, name='rem0te_setup'),
+    path('rmm/rem0te/setup/identity/', rem0te_views.rem0te_setup_identity, name='rem0te_setup_identity'),
+    path('rmm/rem0te/setup/<int:pk>/test/', rem0te_views.rem0te_setup_test, name='rem0te_setup_test'),
     path('rmm/<int:pk>/', views.rmm_detail, name='rmm_detail'),
     path('rmm/<int:pk>/edit/', views.rmm_edit, name='rmm_edit'),
     path('rmm/<int:pk>/delete/', views.rmm_delete, name='rmm_delete'),
     path('rmm/<int:pk>/sync/', views.rmm_trigger_sync, name='rmm_trigger_sync'),
     path('rmm/<int:pk>/pairing/check/', views.rmm_pairing_check, name='rmm_pairing_check'),
+    path('rmm/<int:pk>/pairing/rem0te-identity/', views.rmm_rem0te_identity, name='rmm_rem0te_identity'),
     path('rmm/<int:pk>/import-clients/', views.rmm_import_clients, name='rmm_import_clients'),
 
     # RMM Data Views
@@ -57,6 +61,8 @@ urlpatterns = [
     path('unifi/<int:pk>/sync/', views.unifi_sync, name='unifi_sync'),
     path('unifi/<int:pk>/import-assets/', views.unifi_import_assets, name='unifi_import_assets'),
     path('unifi/<int:pk>/site-org/', views.unifi_site_org, name='unifi_site_org'),
+    path('unifi/<int:pk>/placement/', views.unifi_placement_report, name='unifi_placement_report'),
+    path('unifi/<int:pk>/placement/correct/', views.unifi_placement_correct, name='unifi_placement_correct'),
 
     # M365
     path('m365/create/', views.m365_create, name='m365_create'),

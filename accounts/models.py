@@ -69,6 +69,13 @@ class Membership(BaseModel):
     )
     invited_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='invited_memberships')
     invited_at = models.DateTimeField(auto_now_add=True)
+    # Set when the membership was created by an LDAP group mapping. Only
+    # these memberships are ever changed by directory sign-ins; memberships
+    # created by hand (this is null) are never touched by the mapping.
+    ldap_group_mapping = models.ForeignKey(
+        'LDAPGroupMapping', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='memberships',
+        help_text='LDAP group mapping that manages this membership, if any')
 
     class Meta:
         db_table = 'memberships'
@@ -197,7 +204,7 @@ class Membership(BaseModel):
                 files_view=True, files_upload=True, files_delete=False,
                 monitoring_view=True, monitoring_create=True, monitoring_edit=True,
                 monitoring_delete=False, monitoring_trigger=True,
-                integrations_view=False, integrations_configure=False, integrations_sync=False,
+                integrations_view=True, integrations_configure=False, integrations_sync=False,
                 audit_view=False, audit_export=False,
                 org_view_members=True, org_invite_members=False, org_manage_members=False,
                 org_manage_settings=False,
@@ -250,7 +257,7 @@ class Membership(BaseModel):
                 files_view=True, files_upload=False, files_delete=False,
                 monitoring_view=True, monitoring_create=False, monitoring_edit=False,
                 monitoring_delete=False, monitoring_trigger=False,
-                integrations_view=False, integrations_configure=False, integrations_sync=False,
+                integrations_view=True, integrations_configure=False, integrations_sync=False,
                 audit_view=False, audit_export=False,
                 org_view_members=True, org_invite_members=False, org_manage_members=False,
                 org_manage_settings=False,
@@ -535,6 +542,9 @@ class UserProfile(BaseModel):
         default='local',
         help_text='Authentication source for this user'
     )
+    # When the background LDAP group sync (accounts.ldap_group_sync) last
+    # re-checked this LDAP user's mapped groups; it works oldest-first.
+    ldap_groups_checked_at = models.DateTimeField(null=True, blank=True, editable=False)
     azure_ad_oid = models.CharField(
         max_length=255,
         blank=True,
@@ -912,6 +922,25 @@ class RoleTemplate(BaseModel):
     tickets_delete = models.BooleanField(default=False,
         help_text='Hard-delete a ticket.')
 
+    # Ticket routing (optional, off by default). MSP technicians only; a
+    # customer membership never grants these whatever its role says.
+    routing_manage_rules = models.BooleanField(default=False,
+        help_text='Ticket routing: change settings, customer overrides, rules and on-call shifts.')
+    routing_test = models.BooleanField(default=False,
+        help_text='Ticket routing: use Test routing (read-only dry run).')
+    routing_override = models.BooleanField(default=False,
+        help_text='Ticket routing: accept or reject routing suggestions.')
+
+    # RMM role tier (Phase 8). Read by rmm_permissions from a technician's
+    # global role template only; '' (every pre-existing template) means
+    # technician access and the flags above decide, exactly as before.
+    # Not editable in the role editor: the built-in RMM templates carry it.
+    rmm_tier = models.CharField(
+        max_length=20, blank=True, default='',
+        choices=[('', 'None'), ('l1', 'RMM L1'), ('l2', 'RMM L2'), ('l3', 'RMM L3'),
+                 ('platform_admin', 'Platform Administrator')],
+        help_text='RMM role tier, from the global role template only.')
+
     class Meta:
         db_table = 'role_templates'
         ordering = ['name']
@@ -1057,6 +1086,10 @@ class RoleTemplate(BaseModel):
                 'tickets_view_all': True,
                 'tickets_close': True,
                 'tickets_delete': True,
+                # Ticket routing — all True
+                'routing_manage_rules': True,
+                'routing_test': True,
+                'routing_override': True,
             },
             {
                 'name': 'Administrator',
@@ -1173,6 +1206,10 @@ class RoleTemplate(BaseModel):
                 'tickets_view_all': True,
                 'tickets_close': True,
                 'tickets_delete': True,
+                # Ticket routing — all True
+                'routing_manage_rules': True,
+                'routing_test': True,
+                'routing_override': True,
             },
             {
                 'name': 'Editor',
@@ -1202,7 +1239,7 @@ class RoleTemplate(BaseModel):
                 'monitoring_edit': True,
                 'monitoring_delete': False,
                 'monitoring_trigger': True,
-                'integrations_view': False,
+                'integrations_view': True,
                 'integrations_configure': False,
                 'integrations_sync': False,
                 'audit_view': False,
@@ -1317,7 +1354,7 @@ class RoleTemplate(BaseModel):
                 'monitoring_edit': False,
                 'monitoring_delete': False,
                 'monitoring_trigger': False,
-                'integrations_view': False,
+                'integrations_view': True,
                 'integrations_configure': False,
                 'integrations_sync': False,
                 'audit_view': False,
@@ -1519,6 +1556,10 @@ class RoleTemplate(BaseModel):
                 'tickets_view_all': True,
                 'tickets_close': True,
                 'tickets_delete': True,
+                # Ticket routing — all True
+                'routing_manage_rules': True,
+                'routing_test': True,
+                'routing_override': True,
             },
             {
                 'name': 'Documentation Writer',
@@ -1548,7 +1589,7 @@ class RoleTemplate(BaseModel):
                 'monitoring_edit': False,
                 'monitoring_delete': False,
                 'monitoring_trigger': False,
-                'integrations_view': False,
+                'integrations_view': True,
                 'integrations_configure': False,
                 'integrations_sync': False,
                 'audit_view': False,
@@ -1662,7 +1703,7 @@ class RoleTemplate(BaseModel):
                 'monitoring_edit': False,
                 'monitoring_delete': False,
                 'monitoring_trigger': False,
-                'integrations_view': False,
+                'integrations_view': True,
                 'integrations_configure': False,
                 'integrations_sync': False,
                 'audit_view': False,
@@ -2017,6 +2058,10 @@ class RoleTemplate(BaseModel):
             ),
         ]
 
+        # Phase 8 RMM tiers: L1, L2, L3, Platform Administrator.
+        from .rmm_role_templates import template_rows
+        templates += [dict(defaults, name=name) for name, defaults in template_rows(ALL_FALSE.keys())]
+
         for template_data in templates:
             template, created = cls.objects.get_or_create(
                 name=template_data['name'],
@@ -2025,3 +2070,48 @@ class RoleTemplate(BaseModel):
             )
             if created:
                 print(f"Created system role template: {template.name}")
+
+
+def normalize_group_dn(dn):
+    """Directory DNs compare case-insensitively; whitespace around the
+    comma-separated parts is not significant."""
+    return ','.join(part.strip() for part in (dn or '').split(',')).strip().lower()
+
+
+class LDAPGroupMapping(BaseModel):
+    """Directory group -> customer membership with a role.
+
+    On every LDAP sign-in the user's mapped groups are checked: a membership
+    is created (or re-activated / re-roled) in `organization` for each mapped
+    group the user is in, and memberships created by a mapping are
+    deactivated when the user is no longer in any mapped group for that
+    customer. Memberships not created by a mapping are never touched.
+    """
+    group_dn = models.CharField(max_length=500, help_text='Distinguished name of the directory group')
+    # 500 chars keeps the unique index within MariaDB's utf8mb4 key limit.
+    group_dn_normalized = models.CharField(max_length=500, editable=False)
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE,
+                                     related_name='ldap_group_mappings')
+    role_template = models.ForeignKey('RoleTemplate', on_delete=models.PROTECT,
+                                      related_name='ldap_group_mappings')
+    is_active = models.BooleanField(default=True)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True,
+                                   related_name='+')
+
+    class Meta:
+        db_table = 'ldap_group_mappings'
+        ordering = ['organization__name', 'group_dn']
+        unique_together = [['group_dn_normalized', 'organization']]
+
+    def __str__(self):
+        return f"{self.group_dn} -> {self.organization} ({self.role_template.name})"
+
+    def role_allowed(self):
+        """System / global roles, or the customer's own custom roles."""
+        rt = self.role_template
+        return rt is not None and rt.organization_id in (None, self.organization_id)
+
+    def save(self, *args, **kwargs):
+        self.group_dn = (self.group_dn or '').strip()
+        self.group_dn_normalized = normalize_group_dn(self.group_dn)
+        super().save(*args, **kwargs)

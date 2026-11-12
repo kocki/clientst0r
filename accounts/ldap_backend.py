@@ -18,6 +18,8 @@ Rules:
 - A locally deactivated user cannot sign in through LDAP; directory-disabled
   accounts fail the bind.
 - The bind password and user passwords are never logged or returned.
+- Directory groups can be mapped to customer memberships
+  (accounts.ldap_mapping); only memberships a mapping created are changed.
 """
 import logging
 import os
@@ -282,6 +284,10 @@ class ClientSt0rLDAPBackend(_BaseLDAPBackend):
         if not user.is_active:
             return None
         self._sync_profile(user, getattr(ldap_user, '_cs_is_staff', None))
+        mappings = getattr(ldap_user, '_cs_mappings', None)
+        if mappings is not None:
+            from accounts.ldap_mapping import sync_memberships
+            sync_memberships(user, mappings, getattr(ldap_user, '_cs_mapped_ids', set()))
         logger.info('LDAP sign-in succeeded for %s', user.get_username())
         return user
 
@@ -301,6 +307,14 @@ class ClientSt0rLDAPBackend(_BaseLDAPBackend):
             is_group_member(conn, cfg, cfg.staff_group, ldap_user.dn, uid)
             if cfg.staff_group else None
         )
+        # Group -> customer membership mappings: which mapped groups is the
+        # user in? Evaluated here, while the service-account connection is
+        # bound; applied after the local user is saved.
+        from accounts.ldap_mapping import active_mappings, member_mapping_ids
+        mappings = active_mappings()
+        ldap_user._cs_mappings = mappings
+        ldap_user._cs_mapped_ids = member_mapping_ids(
+            mappings, lambda dn: is_group_member(conn, cfg, dn, ldap_user.dn, uid))
 
         user = model.objects.filter(**{f'{model.USERNAME_FIELD}__iexact': django_username}).first()
         if user is not None:
@@ -328,6 +342,12 @@ class ClientSt0rLDAPBackend(_BaseLDAPBackend):
                 update.append('user_type')
         if update:
             profile.save(update_fields=update + ['updated_at'])
+        # Replace any profile cached on `user` (the post_save signal attaches
+        # one on first sign-in): login() saves the user, and the
+        # save_user_profile signal would re-save that stale copy, putting
+        # auth_source back to 'local' and hiding the user from the background
+        # group sync.
+        user.profile = profile
 
     # Sessions: an LDAP session ends when LDAP is turned off or the user is
     # deactivated locally.

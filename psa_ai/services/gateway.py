@@ -156,8 +156,9 @@ def dispatch(connection, job_id, profile_id, delegation, evidence_digest):
 
     _, _, cost = profiles.estimate(run.profile, len(ev.prompt_text(job.evidence)))
     if cost and not budget.reserve(job.organization, cost, (policy.daily_budget_cents if policy else 0) * 100):
-        _refuse(run, "Today's AI budget for this customer is used up.")
-        raise GatewayRefusal('budget_exhausted', "Today's AI budget for this customer is used up.", 429)
+        why = budget.installation_refusal(cost) or "Today's AI budget for this customer is used up."
+        _refuse(run, why)
+        raise GatewayRefusal('budget_exhausted', why, 429)
     claimed = AnalysisRun.objects.filter(pk=run.pk, status='pending', started_at__isnull=True).update(
         status='dispatched', started_at=timezone.now(), reserved_cost=cost, estimated_cost=cost)
     if not claimed:
@@ -210,9 +211,13 @@ def claim_for_execution(run) -> bool:
     return AnalysisRun.objects.filter(pk=run.pk, status='dispatched').update(status='executing') == 1
 
 
+ANALYSIS_PROMPT = 'system_analysis.md'
+REM0TE_PROMPT = 'rem0te_ticket_triage_v1.md'
+
+
 def _system_prompt():
     from pathlib import Path
-    text = (Path(__file__).resolve().parent.parent / 'prompts' / 'system_analysis.md').read_text()
+    text = (Path(__file__).resolve().parent.parent / 'prompts' / ANALYSIS_PROMPT).read_text()
     return text.replace('Evidence:\n\n{{context}}', 'The evidence is in the user message.').strip()
 
 
@@ -288,9 +293,21 @@ def execute(run):
     run = AnalysisRun.objects.select_related('job', 'profile', 'job__organization').get(pk=run.pk)
     job, profile = run.job, run.profile
     status, result, error, t_in, t_out = 'failed', {}, '', 0, 0
+    # Record what is about to run before the provider is called, so a run
+    # that fails still shows which model and prompt version it used.
+    from .prompt_versions import prompt_version
+    AnalysisRun.objects.filter(pk=run.pk).update(
+        resolved_model=f'{profile.provider}/{profile.model}'[:150],
+        prompt_version=prompt_version(ANALYSIS_PROMPT if job.protocol != job.PROTOCOL_REM0TE
+                                      else REM0TE_PROMPT))
     try:
-        text, t_in, t_out = call_provider(profile, _system_prompt(), wrap_user_content(ev.prompt_text(job.evidence)))
-        result = analysis_result.parse(text, ev.evidence_ids(job.evidence))
+        if job.protocol == job.PROTOCOL_REM0TE:
+            from integrations.rem0te.jobs import execute_run
+            result, t_in, t_out = execute_run(run)
+        else:
+            text, t_in, t_out = call_provider(profile, _system_prompt(),
+                                              wrap_user_content(ev.prompt_text(job.evidence)))
+            result = analysis_result.parse(text, ev.evidence_ids(job.evidence))
         status = 'succeeded'
     except GatewayRefusal as e:
         error = e.message
@@ -316,6 +333,11 @@ def execute(run):
 def finish_job(job):
     """Close the job once every run has an outcome."""
     from psa_ai.models import AnalysisJob
+    if getattr(job, 'protocol', '') == AnalysisJob.PROTOCOL_REM0TE:
+        # Rem0te aggregates the runs and closes the job with a signed
+        # terminal event (integrations/rem0te/jobs.py); a local run
+        # finishing does not end it.
+        return job
     with transaction.atomic():
         job = AnalysisJob.objects.select_for_update().get(pk=job.pk)
         if job.is_terminal:
@@ -342,4 +364,6 @@ def run_worker_once(limit=10) -> int:
         if claim_for_execution(run):
             execute(run)
             done += 1
+    from . import troubleshoot
+    done += troubleshoot.run_worker_once(limit)
     return done

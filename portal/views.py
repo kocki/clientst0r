@@ -25,6 +25,7 @@ from django_ratelimit.decorators import ratelimit
 
 from accounts.models import Membership
 from audit.models import AuditLog
+from psa import ticket_secure as _secure
 from psa.feature_flags import is_psa_enabled, is_psa_enabled_for_client
 from psa.models import (
     ClientPSASettings, Queue, Ticket, TicketAttachment,
@@ -295,7 +296,41 @@ def ticket_detail(request, ticket_number):
         'user_voted': user_voted,
         'voting_enabled': voting_enabled,
         'escalation_enabled': escalation_enabled,
+        # Phase 12: the customer's own secure replies (metadata only).
+        'secure_replies': ticket.secure_replies.filter(author=request.user),
+        'secure_max_length': _secure.MAX_SECURE_LENGTH,
+        'secure_retention_days': _secure.SECURE_REPLY_RETENTION_HOURS // 24,
     })
+
+
+@portal_psa_required
+@require_http_methods(['POST'])
+@ratelimit(key='user', rate='30/h', method='POST', block=False)
+def secure_reply(request, ticket_number):
+    """Phase 12: the customer sends a secure (encrypted, never e-mailed)
+    reply on their ticket."""
+    from psa.models import TicketSecureReply
+    m = request.portal_membership
+    ticket = get_object_or_404(
+        Ticket.objects.filter(organization=m.organization, client_can_view=True),
+        ticket_number=ticket_number,
+    )
+    back = redirect('portal:ticket_detail', ticket_number=ticket_number)
+    if getattr(request, 'limited', False):
+        messages.error(request, 'Too many secure replies. Try again later.')
+        return back
+    if ticket.status_id and ticket.status.is_terminal:
+        messages.error(request, 'This ticket is closed.')
+        return back
+    text = (request.POST.get('reply') or '').strip()
+    if not text or len(text) > _secure.MAX_SECURE_LENGTH:
+        messages.error(request, f'A secure reply must be between 1 and {_secure.MAX_SECURE_LENGTH} characters.')
+        return back
+    _secure.create_secure_reply(
+        ticket=ticket, text=text, via=TicketSecureReply.VIA_PORTAL, author=request.user,
+        author_email=request.user.email or '', ip_address=request.META.get('REMOTE_ADDR'), path=request.path)
+    messages.success(request, 'Secure reply sent. Only the support team can open it.')
+    return back
 
 
 @portal_psa_required
@@ -410,6 +445,8 @@ def post_reply(request, ticket_number):
 def ticket_create(request):
     """Client-side ticket submission."""
     m = request.portal_membership
+    from psa.ticket_site import SOURCE_PORTAL, portal_default_site, portal_sites_for
+    sites = list(portal_sites_for(m.organization)[:200])
 
     if request.method == 'POST':
         subject = (request.POST.get('subject') or '').strip()[:300]
@@ -417,6 +454,15 @@ def ticket_create(request):
         if not subject:
             messages.error(request, 'Subject is required.')
             return redirect(request.path)
+        # Site: one of this customer's own active sites, or none (then the
+        # usual intake rules in psa.ticket_site fill it when they can).
+        raw_site = (request.POST.get('site') or '').strip()
+        site = None
+        if raw_site:
+            site = next((loc for loc in sites if str(loc.pk) == raw_site), None)
+            if site is None:
+                messages.error(request, 'Pick one of your organization\'s sites.')
+                return redirect(request.path)
 
         # Use the client's default queue/priority/type — fall back to any.
         queue = Queue.objects.filter(is_active=True).first()
@@ -436,6 +482,7 @@ def ticket_create(request):
             requester_name=request.user.get_full_name() or request.user.username,
             requester_email=request.user.email or '',
             created_by=request.user,
+            site=site, site_source=SOURCE_PORTAL if site else '',
         )
         AuditLog.log(
             user=request.user, action='create',
@@ -448,8 +495,11 @@ def ticket_create(request):
         messages.success(request, f'Ticket {ticket.ticket_number} created.')
         return redirect('portal:ticket_detail', ticket_number=ticket.ticket_number)
 
+    default_site = portal_default_site(m.organization, request.user) if sites else None
     return render(request, 'portal/ticket_create.html', {
         'organization': m.organization,
+        'sites': sites,
+        'default_site_id': default_site.pk if default_site else None,
     })
 
 
@@ -505,17 +555,40 @@ def quote_sign(request, token):
             messages.error(request, 'Signature image is too large.')
             return redirect(request.path)
 
-        QuoteSignature.objects.update_or_create(
-            quote=quote,
-            defaults={
-                'signed_by_name': signed_by_name,
-                'signed_by_email': signed_by_email,
-                'signed_by_title': signed_by_title,
-                'signature_data': signature_data,
-                'ip_address': _client_ip_qs(request),
-                'user_agent': (request.META.get('HTTP_USER_AGENT') or '')[:400],
-            },
-        )
+        # Bind the signature to the exact revision the customer read: the
+        # page carries the content hash it was rendered from, and a quote
+        # edited since then is refused rather than signed unseen.
+        from django.db import transaction
+        from psa.pdf import render_quote_pdf
+        import hashlib
+        with transaction.atomic():
+            quote = Quote.objects.select_for_update().select_related('client_org', 'organization').get(pk=quote.pk)
+            if QuoteSignature.objects.filter(quote=quote).exists():
+                return render(request, 'portal/quote_sign.html', {
+                    'quote': quote, 'organization': quote.client_org, 'already': True})
+            content_json = quote.content_json()
+            content_hash = hashlib.sha256(content_json).hexdigest()
+            if (request.POST.get('content_hash') or '') != content_hash:
+                messages.error(request, 'This quote changed while you were reading it. '
+                                        'Please review it again before signing.')
+                return redirect(request.path)
+            try:
+                pdf = render_quote_pdf(quote)
+            except Exception:  # noqa: BLE001 — content.json is the evidence; the PDF is a convenience
+                pdf = None
+            QuoteSignature.objects.create(
+                quote=quote,
+                signed_by_name=signed_by_name,
+                signed_by_email=signed_by_email,
+                signed_by_title=signed_by_title,
+                signature_data=signature_data,
+                ip_address=_client_ip_qs(request),
+                user_agent=(request.META.get('HTTP_USER_AGENT') or '')[:400],
+                content_hash=content_hash,
+                content_json=content_json.decode('utf-8'),
+                pdf=pdf,
+                pdf_hash=hashlib.sha256(pdf).hexdigest() if pdf else '',
+            )
 
         # Flip status + optionally create ticket
         queue = Queue.objects.filter(is_active=True).first()
@@ -542,7 +615,8 @@ def quote_sign(request, token):
                 description=f'Quote {quote.quote_number} signed by {signed_by_name} <{signed_by_email}> from IP {_client_ip_qs(request)}',
                 path=request.path,
                 extra_data={'signed_by_email': signed_by_email,
-                            'signed_by_name': signed_by_name},
+                            'signed_by_name': signed_by_name,
+                            'content_hash': content_hash},
             )
         except Exception:
             pass
@@ -557,6 +631,7 @@ def quote_sign(request, token):
         'quote': quote,
         'organization': quote.client_org,
         'line_items': quote.line_items.all(),
+        'content_hash': quote.content_hash(),
     })
 
 
@@ -576,7 +651,8 @@ def kb_list(request):
     q = (request.GET.get('q') or '').strip()
     qs = portal_kb_queryset(m.organization)
     if q:
-        qs = qs.filter(Q(title__icontains=q) | Q(body__icontains=q))
+        from docs.kb_visibility import client_body_matches
+        qs = qs.filter(Q(title__icontains=q) | Q(pk__in=client_body_matches(qs, [q])))
         if not qs.exists():
             from docs.models import SearchQueryLog
             SearchQueryLog.record(q, result_count=0, source='portal_kb',
@@ -611,8 +687,42 @@ def kb_detail(request, slug):
     )
     return render(request, 'portal/kb_detail.html', {
         'article': article,
+        'article_html': article.render_for_client(),
         'organization': m.organization,
     })
+
+
+@portal_required
+@require_http_methods(['GET', 'HEAD'])
+def kb_download(request, slug):
+    """The uploaded file of a customer-visible "Uploaded File" KB article.
+
+    Same visibility rule as kb_detail (portal_kb_queryset: client-visible,
+    live, global or this customer's); anything else, including internal
+    articles and other customers' articles, is a 404. Audited.
+    """
+    import posixpath
+    from django.utils.text import slugify
+    from core.media_views import resolve_under_media_root, stream_file
+    m = request.portal_membership
+    article = (portal_kb_queryset(m.organization)
+               .filter(slug=slug, content_type='file').order_by('pk').first())
+    if article is None or not article.file:
+        raise Http404('Not found')
+    full_path = resolve_under_media_root(article.file.name)
+    if not full_path.is_file():
+        raise Http404('Not found')
+    AuditLog.log(
+        user=request.user, action='read', organization=m.organization,
+        object_type='docs.Document', object_id=article.pk,
+        object_repr=article.title[:255],
+        description=f'Portal download of KB article "{article.title}"',
+        path=request.path,
+        extra_data={'source': 'portal_kb_download', 'global': article.organization_id is None},
+    )
+    ext = posixpath.splitext(article.file.name)[1]
+    download_name = f'{slugify(article.title) or "article"}{ext}'
+    return stream_file(request, full_path, article.file.name, download_name)
 
 
 # ---------------------------------------------------------------------------
@@ -817,12 +927,50 @@ def preferences(request):
             'phone',
             'updated_at',
         ])
+        # Phase 9.4: this customer's weekly security alert digest (opt-in).
+        if request.user.email:
+            _set_security_digest(request, request.POST.get('security_digest') == 'on')
         messages.success(request, 'Preferences saved.')
         return redirect('portal:preferences')
+    digest_sub = _security_digest_sub(request)
     return render(request, 'portal/preferences.html', {
         'profile': profile,
         'organization': request.portal_membership.organization,
+        'security_digest_on': bool(digest_sub and digest_sub.is_subscribed),
     })
+
+
+def _security_digest_sub(request):
+    from security_alerts.models import SecurityDigestSubscription
+    email = (request.user.email or '').strip().lower()
+    if not email:
+        return None
+    return SecurityDigestSubscription.objects.filter(
+        organization=request.portal_membership.organization, email=email).first()
+
+
+def _set_security_digest(request, on):
+    """Opt this portal user in or out for the current customer. A row is
+    only created when opting in."""
+    from security_alerts.models import SecurityDigestSubscription
+    sub = _security_digest_sub(request)
+    if sub is None:
+        if not on:
+            return
+        sub = SecurityDigestSubscription(organization=request.portal_membership.organization,
+                                         email=request.user.email.strip().lower())
+    if sub.user_id is None:
+        sub.user = request.user
+    if sub.pk is None or sub.is_subscribed != on:
+        sub.set_subscribed(on, via='portal', by=request.user)
+        AuditLog.log(
+            user=request.user, action='update', organization=sub.organization,
+            object_type='security_alerts.SecurityDigestSubscription', object_id=sub.pk,
+            object_repr=sub.email,
+            description=f'{sub.email} turned the security digest {"on" if on else "off"} in the portal',
+            path=request.path,
+            extra_data={'event': 'security_digest_subscription', 'action': 'on' if on else 'off'},
+        )
 
 
 SERVICE_REQUEST_APPROVAL_TYPE = 'psa.ServiceCatalogItem'

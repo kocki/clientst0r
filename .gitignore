@@ -102,6 +102,11 @@ logs/
 
 # Certificates and keys
 *.pem
+# Rem0te's contract fixtures: public test keys only
+!integrations/rem0te/contract/fixtures/*.pub.pem
+# Rem0te's published TEST-ONLY example keys (public in its repo) and rev-1 fixture key.
+!integrations/rem0te/contract/examples/keys/*.pem
+!integrations/rem0te/contract/rev1/fixtures/*.pub.pem
 *.key
 *.crt
 *.cer
@@ -249,3 +254,8 @@ walkthrough-raw/
 
 # Hardware catalog source checkout (devicetype-library), fetched by import_hardware_catalog
 /data/hardware-catalog/
+
+# Pre-upgrade snapshots (database, uploads, keys): never commit
+/backups/
+/.update-trigger
+/.update_progress_sandbox.json

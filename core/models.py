@@ -906,12 +906,6 @@ class SystemSetting(models.Model):
     scheduling_enabled = models.BooleanField(default=True, help_text='Enable Scheduling and Task Management')
     psa_enabled = models.BooleanField(default=False, help_text='Enable native PSA / Service Desk feature (off by default)')
     crm_enabled = models.BooleanField(default=False, help_text='Enable CRM / sales pipeline (leads, opportunities, campaigns, commissions). Off by default.')
-    psa_portal_enabled = models.BooleanField(default=False, help_text='Allow customer portal access for PSA clients')
-    psa_anonymous_ticket_form_enabled = models.BooleanField(default=False, help_text='Allow public/anonymous ticket submissions')
-    psa_email_to_ticket_enabled = models.BooleanField(default=False, help_text='Convert inbound emails to tickets')
-    psa_sms_notifications_enabled = models.BooleanField(default=False, help_text='Send SMS to staff (no secrets in body)')
-    psa_desktop_alerts_enabled = models.BooleanField(default=False, help_text='Send desktop / browser alerts to staff')
-    psa_external_alert_ingest_enabled = models.BooleanField(default=False, help_text='Accept alerts from external monitoring/RMM webhooks')
     psa_csat_enabled = models.BooleanField(
         default=False,
         help_text='Email a 1-5 star CSAT survey link to the requester when '
@@ -1043,6 +1037,14 @@ class SystemSetting(models.Model):
     latest_release_version = models.CharField(max_length=32, blank=True, default='')
     latest_release_checked_at = models.DateTimeField(null=True, blank=True)
 
+    # Release channel (core/upgrade/channels.py). Stable installs signed,
+    # published releases only; Preview also offers unreleased commits on main.
+    UPDATE_CHANNEL_CHOICES = [
+        ('stable', 'Stable: latest signed published release'),
+        ('preview', 'Preview: newest commit on main (unreleased)'),
+    ]
+    update_channel = models.CharField(max_length=10, choices=UPDATE_CHANNEL_CHOICES, default='stable')
+
     # Metadata
     updated_at = models.DateTimeField(auto_now=True)
     updated_by = models.ForeignKey('auth.User', on_delete=models.SET_NULL, null=True, blank=True, related_name='system_settings_updates')
@@ -1153,6 +1155,14 @@ class ScheduledTask(models.Model):
         # v3.17.648: recovers missed rem0te callbacks for ticket analysis jobs
         # and expires stale ones (OPTIONAL AI; nothing to do when unused).
         ('poll_analysis_jobs', 'Ticket AI Analysis Job Recovery (optional AI)'),
+        ('run_migration_rehearsals', 'IT Glue / Hudu Migration Rehearsal Worker'),
+        # Phase 9.4: weekly digest of unresolved security alerts to opted-in
+        # customer contacts; Phase 12: erase secure ticket replies past retention.
+        ('send_security_digests', 'Security Alert Weekly Digest (customer contacts)'),
+        ('psa_purge_secure_replies', 'Erase Expired Secure Ticket Replies'),
+        ('agreement_reminders', 'Agreement Signature Reminders'),
+        ('kb_link_check', 'KB Dead Link Check'),
+        ('ldap_group_sync', 'LDAP Group Mapping Sync'),
     ]
 
     task_type = models.CharField(max_length=50, choices=TASK_TYPES, unique=True)
@@ -1642,6 +1652,55 @@ class ScheduledTask(models.Model):
             'description': 'Ask rem0te about unfinished ticket analysis jobs and expire stale ones '
                            '(optional AI; does nothing when no jobs are open)',
             'interval_minutes': 1,
+            'enabled': True,
+        },
+        {
+            # Fetch / build / apply / rollback of one-customer migration
+            # rehearsals run here, never in the web request.
+            'task_type': 'run_migration_rehearsals',
+            'description': 'Run queued IT Glue / Hudu migration rehearsal work '
+                           '(does nothing when nothing is queued)',
+            'interval_minutes': 1,
+            'enabled': True,
+        },
+        {
+            # Opt-in per contact; sends nothing without subscribers, open
+            # alerts and SMTP. Contacts mailed in the last six days are skipped.
+            'task_type': 'send_security_digests',
+            'description': 'E-mail opted-in customer contacts a weekly digest of their unresolved '
+                           'security alerts (nothing is sent without subscribers or open alerts)',
+            'interval_minutes': 10080,
+            'enabled': True,
+        },
+        {
+            'task_type': 'psa_purge_secure_replies',
+            'description': 'Erase the text of secure ticket replies whose retention period has ended',
+            'interval_minutes': 60,
+            'enabled': True,
+        },
+        {
+            # Hourly so a new revision's first notice goes out promptly; each
+            # person is still mailed at most once per the agreement's interval.
+            'task_type': 'agreement_reminders',
+            'description': 'Issue pending agreement revisions and e-mail outstanding signers '
+                           '(throttled per person; respects e-mail opt-out)',
+            'interval_minutes': 60,
+            'enabled': True,
+        },
+        {
+            'task_type': 'kb_link_check',
+            'description': 'Find dead links in published KB articles: internal links to missing or '
+                           'archived documents, and external links (SSRF-safe HEAD check)',
+            'interval_minutes': 1440,
+            'enabled': True,
+        },
+        {
+            # Does nothing unless LDAP sign-in and group mappings are set up.
+            'task_type': 'ldap_group_sync',
+            'description': 'Re-check mapped LDAP group membership for LDAP users who have not '
+                           'signed in again (batch of 100, each user at most hourly; skips and '
+                           'reports when the directory is unreachable)',
+            'interval_minutes': 15,
             'enabled': True,
         },
     ]
@@ -2206,6 +2265,16 @@ class Webhook(models.Model):
     EVENT_INTEGRATION_SYNCED = 'integration.synced'
     EVENT_INTEGRATION_FAILED = 'integration.failed'
 
+    # Tickets, contacts, invoices
+    EVENT_TICKET_CREATED = 'ticket.created'
+    EVENT_TICKET_UPDATED = 'ticket.updated'
+    EVENT_TICKET_STATUS_CHANGED = 'ticket.status_changed'
+    EVENT_CONTACT_CREATED = 'contact.created'
+    EVENT_CONTACT_UPDATED = 'contact.updated'
+    EVENT_INVOICE_CREATED = 'invoice.created'
+    EVENT_INVOICE_UPDATED = 'invoice.updated'
+    EVENT_INVOICE_STATUS_CHANGED = 'invoice.status_changed'
+
     # System
     EVENT_SYSTEM_UPDATE_AVAILABLE = 'system.update_available'
     EVENT_SYSTEM_UPDATE_APPLIED = 'system.update_applied'
@@ -2266,6 +2335,16 @@ class Webhook(models.Model):
         # Integrations
         (EVENT_INTEGRATION_SYNCED, 'Integration Synced'),
         (EVENT_INTEGRATION_FAILED, 'Integration Failed'),
+
+        # Tickets (shared with the customer), contacts, invoices (issued)
+        (EVENT_TICKET_CREATED, 'Ticket Created'),
+        (EVENT_TICKET_UPDATED, 'Ticket Updated'),
+        (EVENT_TICKET_STATUS_CHANGED, 'Ticket Status Changed'),
+        (EVENT_CONTACT_CREATED, 'Contact Created'),
+        (EVENT_CONTACT_UPDATED, 'Contact Updated'),
+        (EVENT_INVOICE_CREATED, 'Invoice Issued'),
+        (EVENT_INVOICE_UPDATED, 'Invoice Updated'),
+        (EVENT_INVOICE_STATUS_CHANGED, 'Invoice Status Changed'),
 
         # System
         (EVENT_SYSTEM_UPDATE_AVAILABLE, 'System Update Available'),
@@ -2526,3 +2605,77 @@ class RecentClient(models.Model):
 
     def __str__(self):
         return f"{self.user_id} -> {self.organization_id} @ {self.switched_at}"
+
+
+class RecentDevice(models.Model):
+    """
+    A device page a user opened, for "Recent devices" on My Work and in the
+    global search box.
+
+    One row per (user, kind, object); opening it again bumps `opened_at`.
+    Written by core.workspace.RecentDeviceMiddleware only after the device's
+    own view answered 200, so a row never records something the user could
+    not open. Rows are still never trusted for access: core.workspace
+    re-reads each device through the same customer and role scoping on every
+    render, so a revoked membership or a device moved to another customer
+    drops out of the list without touching this table.
+    """
+    from django.contrib.auth.models import User
+
+    KIND_ASSET = 'asset'
+    KIND_RMM = 'rmm_device'
+    KIND_HARDWARE = 'hardware'
+    KIND_CHOICES = [
+        (KIND_ASSET, 'Asset'),
+        (KIND_RMM, 'RMM device'),
+        (KIND_HARDWARE, 'Hardware device'),
+    ]
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='recent_devices')
+    kind = models.CharField(max_length=20, choices=KIND_CHOICES)
+    object_id = models.PositiveIntegerField()
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, null=True, blank=True,
+                                     related_name='+')
+    opened_at = models.DateTimeField(db_index=True)
+
+    class Meta:
+        db_table = 'core_recent_devices'
+        unique_together = [['user', 'kind', 'object_id']]
+        ordering = ['-opened_at']
+        indexes = [models.Index(fields=['user', '-opened_at'])]
+
+    def __str__(self):
+        return f"{self.user_id} -> {self.kind}:{self.object_id} @ {self.opened_at}"
+
+
+class SavedView(models.Model):
+    """
+    A technician's named filter set for a dense list (tickets, devices).
+
+    `list_key` names a list in core.workspace.SAVED_VIEW_LISTS; `query` is the
+    list's own query string, re-validated against that list's allowed
+    parameters when saved and again when applied. A saved view is only ever a
+    URL the user could type themselves: it carries no access of its own, and
+    the list view scopes the rows exactly as it would for that URL.
+
+    `is_default` (at most one per user and list) opens the list with that
+    view when the user arrives with no filters of their own.
+    """
+    from django.contrib.auth.models import User
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='saved_views')
+    list_key = models.CharField(max_length=40)
+    name = models.CharField(max_length=60)
+    query = models.CharField(max_length=1000, blank=True)
+    is_default = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'core_saved_views'
+        ordering = ['list_key', 'name']
+        unique_together = [['user', 'list_key', 'name']]
+        indexes = [models.Index(fields=['user', 'list_key'])]
+
+    def __str__(self):
+        return f"{self.user_id} {self.list_key}: {self.name}"

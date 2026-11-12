@@ -8,7 +8,7 @@ from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
 from core.models import Organization, BaseModel
 from core.utils import OrganizationManager
-from vault.secret_fields import SealedTextField, hash_token
+from vault.secret_fields import EncryptedTextField, SealedTextField, hash_token
 
 
 class PSAConnection(BaseModel):
@@ -329,6 +329,11 @@ class RMMConnection(BaseModel):
     sync_devices = models.BooleanField(default=True)
     sync_alerts = models.BooleanField(default=True)
     sync_software = models.BooleanField(default=False)
+    # Opt-in: keep the latest service list per device where the provider's
+    # client already returns one (integrations/rmm_snapshots.py).
+    sync_services = models.BooleanField(default=False, help_text=(
+        "Keep each device's Windows service list where the RMM's device record carries it "
+        "(Tactical RMM). Kept for 14 days, latest only."))
     sync_network_config = models.BooleanField(default=False)
     sync_interval_minutes = models.PositiveIntegerField(default=60)
 
@@ -580,6 +585,8 @@ class RMMDevice(BaseModel):
     last_synced_at = models.DateTimeField(auto_now=True)
     # When the RMM last returned this device's data (not just a local save).
     data_refreshed_at = models.DateTimeField(null=True, blank=True)
+    # Last "Refresh from RMM" from the Device Workspace (rate limit).
+    manual_refresh_at = models.DateTimeField(null=True, blank=True)
 
     objects = OrganizationManager()
 
@@ -690,6 +697,36 @@ class RMMSoftware(BaseModel):
         return f"{self.name}{version_str}{vendor_str}"
 
 
+class RMMDeviceSnapshot(BaseModel):
+    """The latest list of one kind (services today) an RMM reported for a
+    device, with when it was collected. One row per device and kind: each
+    collection replaces the last, and rows older than the retention window
+    are deleted (integrations/rmm_snapshots.py). Follows the device's
+    customer; deleted when the device changes customer."""
+    KIND_SERVICES = 'services'
+    KIND_CHOICES = [(KIND_SERVICES, 'Services')]
+
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='rmm_snapshots',
+                                     null=True, blank=True)
+    connection = models.ForeignKey(RMMConnection, on_delete=models.CASCADE, related_name='snapshots')
+    device = models.ForeignKey(RMMDevice, on_delete=models.CASCADE, related_name='snapshots')
+    kind = models.CharField(max_length=20, choices=KIND_CHOICES)
+    items = models.JSONField(default=list, blank=True)
+    item_count = models.PositiveIntegerField(default=0)
+    truncated = models.BooleanField(default=False)
+    collected_at = models.DateTimeField()
+
+    objects = OrganizationManager()
+
+    class Meta:
+        db_table = 'rmm_device_snapshots'
+        unique_together = [['device', 'kind']]
+        indexes = [models.Index(fields=['collected_at'])]
+
+    def __str__(self):
+        return f"{self.kind} of {self.device_id} at {self.collected_at:%Y-%m-%d %H:%M}"
+
+
 # ============================================================================
 # UniFi Integration Models
 # ============================================================================
@@ -732,7 +769,7 @@ class UnifiConnection(BaseModel):
 
     # Cloud org assignment: maps site name → Organization.id (cloud mode only)
     site_org_map = models.JSONField(default=dict, blank=True,
-                                    help_text='Cloud mode: maps site name to organization ID')
+                                    help_text='Maps controller site id (or, for older mappings, site name) to a customer organization ID')
 
     # Link to generated doc
     doc = models.ForeignKey('docs.Document', on_delete=models.SET_NULL, null=True, blank=True, related_name='unifi_connections')
@@ -1424,3 +1461,147 @@ class TaxConnection(BaseModel):
         creds = self.get_credentials()
         creds.update(kwargs)
         self.set_credentials(creds)
+
+
+# ============================================================================
+# Standard sync health (one row per connection, any integration type)
+# ============================================================================
+
+class IntegrationSyncHealth(models.Model):
+    """
+    Outcome of the most recent sync attempt for one integration connection.
+
+    Written only through `integrations.health.record_sync()`, which redacts
+    credentials from everything it stores. Connections that have never written
+    a row are rendered from their legacy `last_sync_*` fields instead.
+    """
+    STATUS_CHOICES = [
+        ('never', 'Never synced'),
+        ('success', 'Success'),
+        ('partial', 'Partial'),
+        ('error', 'Error'),
+    ]
+
+    content_type = models.ForeignKey(ContentType, on_delete=models.CASCADE)
+    object_id = models.PositiveIntegerField()
+    connection = GenericForeignKey('content_type', 'object_id')
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, null=True, blank=True,
+                                     related_name='integration_sync_health')
+    kind = models.CharField(max_length=40, blank=True, help_text='unifi, omada, psa, rmm, m365, ...')
+
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='never')
+    last_attempt_at = models.DateTimeField(null=True, blank=True)
+    last_success_at = models.DateTimeField(null=True, blank=True)
+
+    created_count = models.PositiveIntegerField(default=0)
+    updated_count = models.PositiveIntegerField(default=0)
+    skipped_count = models.PositiveIntegerField(default=0)
+    failed_count = models.PositiveIntegerField(default=0)
+
+    error = models.TextField(blank=True, help_text='Redacted error from the last attempt')
+    issues = models.JSONField(default=list, blank=True,
+                              help_text='Affected customers/sites: [{message, customer, site, action, kind}]')
+    corrective_action = models.TextField(blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'integration_sync_health'
+        # One row per (connection, kind): a connection's sync and its RMM
+        # contract pairing (kind 'rem0te', integrations.rem0te.health) each
+        # keep their own outcome.
+        unique_together = [['content_type', 'object_id', 'kind']]
+
+    def __str__(self):
+        return f"{self.kind}#{self.object_id}: {self.status}"
+
+
+# ============================================================================
+# Network controller device → asset links (stable dedup key)
+# ============================================================================
+
+class NetworkAssetLink(models.Model):
+    """
+    Which asset a network-controller device was imported as.
+
+    Keyed by (source, connection_id, device_key) where device_key is
+    'mac:<normalised mac>' or 'serial:<serial>'. Lets repeated syncs (scheduled
+    and manual) update the same asset instead of creating another, and lets the
+    placement report tell which assets a controller produced.
+    """
+    source = models.CharField(max_length=20)  # unifi / omada / grandstream
+    connection_id = models.PositiveIntegerField()
+    device_key = models.CharField(max_length=300)
+    asset = models.ForeignKey('assets.Asset', on_delete=models.CASCADE, related_name='network_links')
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='network_asset_links')
+    site_id = models.CharField(max_length=255, blank=True)
+    site_name = models.CharField(max_length=255, blank=True)
+    first_seen_at = models.DateTimeField(auto_now_add=True)
+    last_seen_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'network_asset_links'
+        unique_together = [['source', 'connection_id', 'device_key']]
+        indexes = [models.Index(fields=['source', 'connection_id'])]
+
+    def __str__(self):
+        return f"{self.source}#{self.connection_id} {self.device_key} → asset {self.asset_id}"
+
+
+# ===========================================================================
+# Rem0te ticket-rmm-v1 (Ed25519). integrations/rem0te/ has the protocol.
+# ===========================================================================
+
+class Rem0teIdentity(models.Model):
+    """ClientSt0r's own identity towards Rem0te: one row per install.
+
+    Rem0te lists ClientSt0r once in its root-owned INTEGRATION_PEERS_FILE —
+    a peer id, the audience Rem0te signs for (`peerAudience`), two public
+    keys and two URLs — and maps each ClientSt0r organization to a business.
+    Every Rem0te connection here shares this identity.
+
+    Two keys, as the contract requires: the *request* key signs requests to
+    Rem0te and inference responses; the *delegation* key mints technician
+    delegation tokens. A stolen request key alone cannot act as a
+    technician. Private keys are encrypted at rest (enc2$ envelope, like
+    every other integration secret) and are never shown, exported or sent.
+    """
+    peer_id = models.CharField(max_length=64, default='clientst0r',
+                               help_text="ClientSt0r's peer id in Rem0te's peers file (peers[].id).")
+    audience = models.CharField(max_length=256, blank=True, default='',
+                                help_text="ClientSt0r's audience (peers[].peerAudience): what Rem0te signs "
+                                          'its requests to ClientSt0r for.')
+    public_base_url = models.URLField(max_length=500, blank=True, default='',
+                                      help_text='Where Rem0te reaches ClientSt0r (https; http only for loopback).')
+    request_kid = models.CharField(max_length=64, blank=True, default='')
+    request_private_key = EncryptedTextField(blank=True, default='')
+    delegation_kid = models.CharField(max_length=64, blank=True, default='')
+    delegation_private_key = EncryptedTextField(blank=True, default='')
+    # Overlapping rotation: the next key pair is staged here, listed in the
+    # peers-file entry next to the current one, and only signs once an
+    # administrator confirms Rem0te was restarted with it (promote).
+    next_request_kid = models.CharField(max_length=64, blank=True, default='')
+    next_request_private_key = EncryptedTextField(blank=True, default='')
+    next_delegation_kid = models.CharField(max_length=64, blank=True, default='')
+    next_delegation_private_key = EncryptedTextField(blank=True, default='')
+    next_staged_at = models.DateTimeField(null=True, blank=True)
+    rotated_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'integrations_rem0te_identity'
+
+    def __str__(self):
+        return f'Rem0te identity {self.peer_id}'
+
+
+class Rem0teReplayGuard(models.Model):
+    """Single-use markers for requests Rem0te signs to ClientSt0r (request
+    nonces). One INSERT is the test-and-set, so two concurrent replays cannot
+    both win, and the rows outlive the clock-skew window and a restart."""
+    key = models.CharField(max_length=200, unique=True)
+    expires_at = models.DateTimeField(db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'integrations_rem0te_replay_guard'

@@ -10,6 +10,7 @@ app_name = 'portal'
 # it inherits the portal's rules rather than reimplementing them.
 from statuspage.views import portal_status as _status_view  # noqa: E402
 from . import request_views as _request_views  # noqa: E402
+from . import agreement_views as _agreement_views  # noqa: E402
 
 urlpatterns = [
     path('', views.ticket_list, name='ticket_list'),
@@ -20,6 +21,8 @@ urlpatterns = [
     path('new/', views.ticket_create, name='ticket_create'),
     path('t/<str:ticket_number>/', views.ticket_detail, name='ticket_detail'),
     path('t/<str:ticket_number>/reply/', views.post_reply, name='post_reply'),
+    # Phase 12: secure (encrypted, never e-mailed) reply.
+    path('t/<str:ticket_number>/secure-reply/', views.secure_reply, name='secure_reply'),
     # v3.17.235 — Phase 12: portal user "I care about this too" vote.
     path('t/<str:ticket_number>/vote/', views.ticket_vote, name='ticket_vote'),
     # v3.17.236 — Phase 12: portal user escalation.
@@ -29,6 +32,7 @@ urlpatterns = [
     # Knowledge base for portal users
     path('kb/', views.kb_list, name='kb_list'),
     path('kb/<slug:slug>/', views.kb_detail, name='kb_detail'),
+    path('kb/<slug:slug>/download/', views.kb_download, name='kb_download'),
     # Vault access for portal users
     path('vault/', views.vault_list, name='vault_list'),
     path('vault/<int:pk>/reveal/', views.vault_reveal, name='vault_reveal'),
@@ -45,6 +49,14 @@ urlpatterns = [
     path('requests/<slug:slug>/', _request_views.request_form, name='request_form'),
     path('requests/<slug:slug>/kb/', _request_views.request_kb_suggest,
          name='request_kb_suggest'),
+    # Version-specific agreements: MSAs, SOWs, policy acknowledgments.
+    path('agreements/', _agreement_views.agreement_list, name='agreement_list'),
+    path('agreements/<int:pk>/', _agreement_views.agreement_detail, name='agreement_detail'),
+    path('agreements/evidence/<int:pk>/', _agreement_views.agreement_evidence, name='agreement_evidence'),
+    path('agreements/revisions/<int:pk>/file/', _agreement_views.agreement_file, name='agreement_file'),
+    # Signed, no-login link in reminder e-mails: stop reminders for one agreement.
+    path('agreements/reminders/unsubscribe/<str:token>/', _agreement_views.agreement_reminder_unsubscribe,
+         name='agreement_reminder_unsubscribe'),
     # Customer switcher for users who belong to several customers.
     path('switch/', views.switch_customer, name='switch_customer'),
 ]

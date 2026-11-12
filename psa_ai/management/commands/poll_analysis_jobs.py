@@ -1,7 +1,10 @@
 """Poll the paired RMMs for unfinished analysis jobs and RMM requests,
 expire stale ones, and refresh pairings' capabilities, so a missed callback
 never leaves anything hanging. Safe to run every minute; the scheduler runs
-it as task `poll_analysis_jobs`."""
+it as task `poll_analysis_jobs`.
+
+It also purges ticket AI and automation history past each customer's
+retention window (services/history.py), at most every six hours."""
 import logging
 from datetime import timedelta
 
@@ -41,13 +44,37 @@ class Command(BaseCommand):
         except Exception:
             logger.exception('expiring RMM requests failed')
         self._refresh_capabilities()
+        self._rem0te()
+        self._purge_history()
+
+    def _purge_history(self):
+        from psa_ai.services import history
+        try:
+            counts = history.purge_if_due()
+        except Exception:
+            logger.exception('purging ticket AI history failed')
+            return
+        if counts and any(counts.values()):
+            self.stdout.write('AI history purged: ' + ', '.join(f'{v} {k}' for k, v in counts.items() if v))
+
+    def _rem0te(self):
+        """Rem0te: reconciliation (integrations/rem0te/reconcile.py) —
+        capabilities re-check with backoff, alert events missed while
+        ClientSt0r was down, ticket link retries, open action proposals —
+        with every outcome on the connection's integration health."""
+        from integrations.rem0te.reconcile import reconcile_all
+        try:
+            reconcile_all(self.stdout)
+        except Exception:
+            logger.exception('reconciling Rem0te connections failed')
 
     def _refresh_capabilities(self):
         from integrations.models import RMMConnection
         from integrations.ticket_rmm import check, settings
         from django.utils.dateparse import parse_datetime
         now = timezone.now()
-        for conn in RMMConnection.objects.filter(is_active=True):
+        # Rem0te connections are re-checked by their reconciliation (with backoff).
+        for conn in RMMConnection.objects.filter(is_active=True).exclude(provider_type='rem0te'):
             try:
                 if not settings(conn)['enabled']:
                     continue

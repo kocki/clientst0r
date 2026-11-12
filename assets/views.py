@@ -19,30 +19,55 @@ from .views_custom import can_manage_asset_catalog, require_catalog_manager
 @login_required
 def asset_list(request):
     """
-    List all assets in current organization with filtering.
-    In global view mode, shows all assets across all organizations.
+    List assets in the current organization (and its sites) with filters,
+    a stable sort and server-side paging. In Global View, MSP staff see every
+    customer's assets. Filters, sort and page size are query parameters
+    (assets/list_filters.py), so saved views and bookmarks keep working.
     """
+    from django.core.paginator import Paginator
+    from psa.visibility import is_msp_staff
+    from . import list_filters as lf
+
     org = get_request_organization(request)
 
     # Check if user is in global view mode (no org but is superuser/staff)
     is_staff = request.is_staff_user if hasattr(request, 'is_staff_user') else False
     in_global_view = not org and (request.user.is_superuser or is_staff)
+    staff_filters = bool(is_msp_staff(request.user))
 
     if in_global_view:
         # Global view: show all assets across all organizations
-        assets = Asset.objects.all().select_related('organization').prefetch_related('tags').select_related('primary_contact', 'equipment_model__vendor', 'artwork_model', 'hardware')
         all_assets = Asset.objects.all()
     else:
         # Organization view: show only assets for current org
-        assets = Asset.objects.for_organization(org).prefetch_related('tags').select_related('primary_contact', 'equipment_model__vendor', 'artwork_model', 'hardware')
         all_assets = Asset.objects.for_organization(org)
+    assets = all_assets.select_related(
+        'organization', 'primary_contact', 'equipment_model__vendor', 'artwork_model', 'hardware',
+    ).prefetch_related('tags')
 
     # Apply filters
-    filter_type = request.GET.get('type', '')
-    filter_manufacturer = request.GET.get('manufacturer', '')
-    filter_status = request.GET.get('status', '')
-    filter_location = request.GET.get('location', '')
-    filter_needs_reorder = request.GET.get('needs_reorder', '')
+    get = request.GET
+    filter_type = get.get('type', '')
+    filter_manufacturer = get.get('manufacturer', '')
+    filter_status = get.get('status', '')
+    filter_location = get.get('location', '')
+    filter_needs_reorder = get.get('needs_reorder', '')
+    filter_q = (get.get('q') or get.get('search') or '').strip()[:100]
+    filter_client = get.get('client', '')
+    filter_rmm = get.get('rmm', '') if staff_filters else ''
+    filter_alerts = get.get('alerts', '') if staff_filters else ''
+
+    # Customers present in the scoped list; any other id is ignored.
+    customer_ids = set(all_assets.values_list('organization_id', flat=True).distinct())
+    customers = []
+    if len(customer_ids) > 1:
+        from core.models import Organization
+        customers = list(Organization.objects.filter(pk__in=customer_ids).order_by('name')
+                         .values('pk', 'name'))
+    if filter_client.isdigit() and int(filter_client) in customer_ids:
+        assets = assets.filter(organization_id=int(filter_client))
+    else:
+        filter_client = ''
 
     if filter_type:
         assets = assets.filter(asset_type=filter_type)
@@ -55,11 +80,34 @@ def asset_list(request):
         assets = assets.filter(custom_fields__status=filter_status)
 
     if filter_location:
-        # Location is typically stored in custom_fields
+        # Location (site) is typically stored in custom_fields
         assets = assets.filter(custom_fields__location__icontains=filter_location)
 
     if filter_needs_reorder:
         assets = assets.filter(needs_reorder=True)
+
+    assets = lf.text_filter(assets, filter_q)
+
+    has_rmm = False
+    if staff_filters:
+        from integrations.models import RMMConnection
+        has_rmm = RMMConnection.objects.exists()
+        if filter_rmm in dict(lf.RMM_STATES):
+            assets = lf.rmm_filter(assets, filter_rmm)
+        else:
+            filter_rmm = ''
+        if filter_alerts == 'active':
+            assets = lf.alerts_filter(assets)
+        else:
+            filter_alerts = ''
+
+    sort = get.get('sort', '')
+    if sort not in lf.SORTS:
+        sort = lf.DEFAULT_SORT
+    assets = assets.order_by(*lf.SORTS[sort][1])
+    per_page = lf.page_size(get.get('per_page'))
+    page = Paginator(assets, per_page).get_page(get.get('page'))
+    rows = list(page.object_list)
 
     # Get unique values for filter dropdowns
     manufacturers = all_assets.exclude(manufacturer='').values_list('manufacturer', flat=True).distinct().order_by('manufacturer')
@@ -89,22 +137,45 @@ def asset_list(request):
     asset_age_statuses = {}
     if sys_settings.asset_age_warnings_enabled:
         svc = AssetAgeService(sys_settings)
-        for a in assets:
+        for a in rows:  # only the rows on this page
             status = svc.get_age_status(a)
             if status:
                 asset_age_statuses[a.pk] = status
 
+    keep = request.GET.copy()
+    keep.pop('page', None)
+    filters_active = any([filter_type, filter_manufacturer, filter_status, filter_location,
+                          filter_needs_reorder, filter_q, filter_client, filter_rmm, filter_alerts])
+
     return render(request, 'assets/asset_list.html', {
-        'assets': assets,
+        'assets': rows,
+        'page_obj': page,
+        'page_query': keep.urlencode(),
+        'total_count': page.paginator.count,
+        'any_assets': bool(customer_ids),
+        'filters_active': filters_active,
         'manufacturers': manufacturers,
         'asset_types': asset_types,
         'statuses': sorted(statuses),
         'locations': sorted(locations),
+        'customers': customers,
         'filter_type': filter_type,
         'filter_manufacturer': filter_manufacturer,
         'filter_status': filter_status,
         'filter_location': filter_location,
         'filter_needs_reorder': filter_needs_reorder,
+        'filter_q': filter_q,
+        'filter_client': filter_client,
+        'filter_rmm': filter_rmm,
+        'filter_alerts': filter_alerts,
+        'sort': sort,
+        'sorts': [(k, v[0]) for k, v in lf.SORTS.items()],
+        'per_page': per_page,
+        'page_sizes': lf.PAGE_SIZES,
+        'rmm_states': lf.RMM_STATES,
+        'staff_filters': staff_filters,
+        'has_rmm': has_rmm,
+        'rmm_rows': lf.rmm_rows(rows) if staff_filters and has_rmm else {},
         'in_global_view': in_global_view,
         'health_enabled': health_enabled,
         'asset_age_enabled': sys_settings.asset_age_warnings_enabled,
@@ -150,6 +221,10 @@ def asset_detail(request, pk):
         entity_id=asset.id,
         content_type__startswith='image/'
     ).order_by('-created_at')[:50]
+    from accounts.permission_utils import has_perm_for_org
+    if not has_perm_for_org(request.user, asset_org, 'files_view'):
+        # Attachments follow files_view (their downloads already do).
+        asset_images = Attachment.objects.none()
 
     from docs.services.llm_providers import is_llm_configured
     has_ai, _ = is_llm_configured()
@@ -159,9 +234,12 @@ def asset_detail(request, pk):
     # never shows another customer's machine here.
     # Technicians only, like the ticket page: RMM status, software, alerts
     # and the console links are MSP working data, never shown to customers.
+    # The integrations_view flag (or RMM device access) for this customer
+    # decides it, as it does for the same devices under /integrations/.
     from integrations.rmm_association import exposed_devices, summaries_for_asset
+    from integrations.rmm_visibility import can_see_rmm_data
     from psa.visibility import is_msp_staff
-    if is_msp_staff(request.user):
+    if can_see_rmm_data(request.user, asset_org):
         rmm_devices = exposed_devices(asset).prefetch_related('software', 'alerts')
         rmm_summaries = summaries_for_asset(asset)
     else:
@@ -199,7 +277,11 @@ def asset_detail(request, pk):
         logging.getLogger(__name__).exception('Asset illustration failed for asset %s', asset.pk)
 
     from assets.custom_types import display_rows
+    from assets.models import SerialEvent
+    from assets.serial_lifecycle import history_for_asset
     return render(request, 'assets/asset_detail.html', {
+        'serial_history': list(history_for_asset(asset)),
+        'serial_manual_events': [c for c in SerialEvent.EVENT_CHOICES if c[0] in SerialEvent.MANUAL_EVENTS],
         'art': art,
         'device_url': device_url,
         'search_q': f'{asset.manufacturer} {asset.model}'.strip(),
@@ -207,10 +289,13 @@ def asset_detail(request, pk):
         'custom_field_rows': display_rows(asset),
         'relationships': relationships,
         'asset_images': asset_images,
+        'can_upload_files': has_perm_for_org(request.user, asset_org, 'files_upload'),
+        'can_delete_files': has_perm_for_org(request.user, asset_org, 'files_delete'),
         'in_global_view': in_global_view,
         'has_ai': has_ai,
         'rmm_devices': rmm_devices,
         'rmm_summaries': rmm_summaries,
+        'can_workspace': is_msp_staff(request.user),
         'asset_age_enabled': sys_settings.asset_age_warnings_enabled,
         'firmware_enabled': sys_settings.firmware_checks_enabled,
         'warranty_enabled': sys_settings.warranty_checks_enabled,
@@ -299,6 +384,7 @@ def asset_edit(request, pk):
             new_port_count = form.cleaned_data.get('port_count')
 
             asset = form.save(commit=False)
+            asset._serial_actor = request.user  # serial history (assets.serial_lifecycle)
 
             # Re-initialize ports if count changed
             if new_port_count and asset.has_ports() and new_port_count != old_port_count:
@@ -370,7 +456,21 @@ def contact_detail(request, pk):
     if not request.user.is_superuser:
         notes_qs = notes_qs.filter(is_private=False) | notes_qs.filter(author=request.user)
 
+    # Staff: the contact's default ticket site (Phase 60.6), set on the PSA
+    # requester sites page.
+    from psa.feature_flags import is_psa_enabled
+    from psa.visibility import is_msp_staff
+    show_ticket_site = is_psa_enabled() and is_msp_staff(request.user)
+    default_ticket_site = None
+    if show_ticket_site:
+        from psa.models import RequesterDefaultSite
+        row = RequesterDefaultSite.objects.filter(
+            organization=org, contact=contact).select_related('location').first()
+        default_ticket_site = row.location if row else None
+
     return render(request, 'assets/contact_detail.html', {
+        'show_ticket_site': show_ticket_site,
+        'default_ticket_site': default_ticket_site,
         'contact': contact,
         'assets': assets,
         'ratings': ratings_qs,
@@ -1709,7 +1809,9 @@ def rma_create(request):
         if asset_id:
             rma.asset = Asset.objects.filter(organization=org, pk=asset_id).first()
         if po_id:
-            rma.purchase_order = PurchaseOrder.objects.filter(pk=po_id).first()
+            # Only this customer's purchase orders (the form offers no others).
+            rma.purchase_order = PurchaseOrder.objects.filter(organization=org, pk=po_id).first()
+        rma._serial_actor = request.user  # serial history (assets.serial_lifecycle)
         rma.save()
         messages.success(request, f'Opened RMA {rma.rma_number or rma.pk}.')
         return redirect('assets:rma_detail', pk=rma.pk)
@@ -1755,6 +1857,118 @@ def rma_transition(request, pk):
             rma.refund_amount = request.POST.get('refund_amount') or None
         except (TypeError, ValueError):
             rma.refund_amount = None
+    rma._serial_actor = request.user  # serial history (assets.serial_lifecycle)
     rma.save()
     messages.success(request, f'RMA marked {rma.get_status_display()}.')
     return redirect('assets:rma_detail', pk=pk)
+
+
+# ---------------------------------------------------------------------------
+# Phase 13 — serial lifecycle: search by serial, record a lifecycle event
+# ---------------------------------------------------------------------------
+
+@login_required
+def serial_search(request):
+    """Serial history search. Scoped to the active customer (and its
+    sites); staff in global view search every customer."""
+    from .models import SerialEvent, RMAReturn
+    from . import serial_lifecycle
+    org = get_request_organization(request)
+    is_staff = getattr(request, 'is_staff_user', False)
+    in_global_view = not org and (request.user.is_superuser or is_staff)
+    if in_global_view:
+        events, assets, rmas = SerialEvent.objects.all(), Asset.objects.all(), RMAReturn.objects.all()
+    else:
+        events = SerialEvent.objects.for_organization(org)
+        assets = Asset.objects.for_organization(org)
+        rmas = RMAReturn.objects.for_organization(org)
+
+    q = (request.GET.get('q') or '').strip()
+    key = serial_lifecycle.normalize(q)
+    groups = []
+    if key:
+        found = (serial_lifecycle.search(events, q)
+                 .select_related('organization', 'asset', 'rma', 'purchase_order', 'actor')
+                 .order_by('serial_key', 'organization__name', 'occurred_at', 'id')[:500])
+        by_serial = {}
+        for ev in found:
+            by_serial.setdefault((ev.serial_key, ev.organization_id), {'events': [], 'assets': [], 'rmas': [],
+                                                                        'organization': ev.organization,
+                                                                        'serial': ev.serial_number})
+            by_serial[(ev.serial_key, ev.organization_id)]['events'].append(ev)
+        # Assets and RMAs whose serial matches, including units recorded
+        # before serial tracking existed (they have no events yet).
+        for a in assets.filter(serial_number__icontains=key).select_related('organization')[:500]:
+            k = serial_lifecycle.normalize(a.serial_number)
+            if key in k:
+                g = by_serial.setdefault((k, a.organization_id), {
+                    'events': [], 'assets': [], 'rmas': [], 'organization': a.organization,
+                    'serial': a.serial_number})
+                g['assets'].append(a)
+        for r in rmas.filter(serial_number__icontains=key).select_related('vendor')[:500]:
+            k = serial_lifecycle.normalize(r.serial_number)
+            if (k, r.organization_id) in by_serial:
+                by_serial[(k, r.organization_id)]['rmas'].append(r)
+        groups = sorted(by_serial.values(), key=lambda g: (g['serial'].upper(), str(g['organization'])))
+        for g in groups:
+            g['last'] = g['events'][-1] if g['events'] else None
+    return render(request, 'assets/serial_search.html', {
+        'q': q, 'groups': groups[:200], 'in_global_view': in_global_view,
+    })
+
+
+@login_required
+@require_write
+def asset_serial_event_add(request, pk):
+    """POST: record a manual lifecycle event (returned / retired / disposed /
+    note) for the asset's current serial."""
+    import datetime as _dt
+    from django.utils import timezone as _tz
+    from django.utils.dateparse import parse_date
+    from .models import SerialEvent
+    from . import serial_lifecycle
+    if request.method != 'POST':
+        return redirect('assets:asset_detail', pk=pk)
+    org = get_request_organization(request)
+    if org is None and (request.user.is_superuser or getattr(request, 'is_staff_user', False)):
+        asset = get_object_or_404(Asset, pk=pk)
+    else:
+        asset = get_org_object_or_404(Asset, org, pk=pk)
+    back = reverse('assets:asset_detail', args=[asset.pk]) + '#serial-history'
+    event_type = (request.POST.get('event_type') or '').strip()
+    if event_type not in SerialEvent.MANUAL_EVENTS:
+        messages.error(request, 'Pick returned, retired, disposed or note.')
+        return redirect(back)
+    if not serial_lifecycle.normalize(asset.serial_number):
+        messages.error(request, 'This asset has no serial number to record history for.')
+        return redirect(back)
+    notes = (request.POST.get('notes') or '').strip()[:2000]
+    if event_type == 'note' and not notes:
+        messages.error(request, 'A note needs some text.')
+        return redirect(back)
+    when = None
+    raw_day = (request.POST.get('occurred_on') or '').strip()
+    if raw_day:
+        try:
+            day = parse_date(raw_day)
+        except ValueError:
+            day = None
+        if day is None:
+            messages.error(request, 'The date is not valid.')
+            return redirect(back)
+        if day > _tz.localdate():
+            messages.error(request, 'The date cannot be in the future.')
+            return redirect(back)
+        when = _tz.make_aware(_dt.datetime.combine(day, _dt.time(12, 0)))
+    ev = serial_lifecycle.record(asset.organization, asset.serial_number, event_type, asset=asset,
+                                 actor=request.user, notes=notes, when=when)
+    try:
+        from audit.models import AuditLog
+        AuditLog.log(user=request.user, action='update', organization=asset.organization,
+                     object_type='asset', object_id=asset.pk, object_repr=asset.name,
+                     description=f'Serial {asset.serial_number}: {ev.get_event_type_display()}',
+                     path=request.path)
+    except Exception:  # noqa: BLE001 - the audit row must not block the record
+        pass
+    messages.success(request, f'Recorded "{ev.get_event_type_display()}" for serial {asset.serial_number}.')
+    return redirect(back)
